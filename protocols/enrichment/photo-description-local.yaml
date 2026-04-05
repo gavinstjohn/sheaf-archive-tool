@@ -1,0 +1,23 @@
+name: photo-description-local
+type: enrichment
+version: '1'
+created: '2026-04-05'
+maturity: draft
+description: Generate photo descriptions and tags locally using moondream vision model via Ollama.
+media_types:
+- photo
+output_fields:
+- description
+- tags
+- subject
+method: ollama
+ollama_model: moondream
+instructions: >
+  Analyze this photo and return a JSON object with exactly these fields:
+  "description" (a 1-2 sentence description of what is in the photo),
+  "subject" (the primary subject in 2-5 words),
+  "tags" (a JSON array of 3-8 descriptive tags as lowercase strings).
+  Return ONLY valid JSON. Example:
+  {"description": "A mountain trail winds through a pine forest on a sunny day.",
+   "subject": "mountain forest trail",
+   "tags": ["nature", "forest", "trail", "mountains", "outdoors", "pine trees"]}

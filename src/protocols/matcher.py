@@ -1,0 +1,126 @@
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import dataclass
+from pathlib import Path
+
+from ..adapter.base import BaseAdapter, Message
+from .model import ImportProtocol
+
+log = logging.getLogger(__name__)
+
+_MAX_SOURCE_FILES = 30   # files to sample when describing the source to the model
+
+
+@dataclass
+class ProtocolMatch:
+    protocol: ImportProtocol
+    confidence: float      # 0.0 – 1.0
+    reasoning: str
+
+
+def match_protocols(
+    source_path: Path,
+    protocols: dict[str, ImportProtocol],
+    adapter: BaseAdapter,
+    confidence_threshold: float = 0.75,
+) -> list[ProtocolMatch]:
+    """Ask the model to score each protocol against the source.
+
+    Returns matches sorted by confidence (highest first).
+    Returns an empty list if there are no protocols to match against.
+    """
+    if not protocols:
+        return []
+
+    source_summary = _summarise_source(source_path)
+    protocol_descriptions = _describe_protocols(protocols)
+
+    prompt = f"""You are evaluating whether any known import protocols match a media source.
+
+Source path: {source_path}
+Source contents:
+{source_summary}
+
+Known protocols:
+{protocol_descriptions}
+
+For each protocol, assign a confidence score (0.0 to 1.0) indicating how well it matches this source.
+- 1.0 = certain match (triggers clearly satisfied by the source files)
+- 0.0 = definitely not a match
+
+Respond with a JSON array only, no other text:
+[
+  {{"name": "<protocol_name>", "confidence": 0.95, "reasoning": "<one sentence>"}},
+  ...
+]"""
+
+    response = adapter.chat(
+        [Message(role="user", content=prompt)],
+        system="You are a media archive assistant. Respond only with the requested JSON.",
+    )
+
+    try:
+        raw = response.content.strip()
+        # Strip markdown code fences if present
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        scores = json.loads(raw)
+    except (json.JSONDecodeError, IndexError) as e:
+        log.warning("Could not parse protocol match response: %s\n%s", e, response.content)
+        return []
+
+    matches = []
+    for item in scores:
+        name = item.get("name")
+        if name not in protocols:
+            continue
+        matches.append(ProtocolMatch(
+            protocol=protocols[name],
+            confidence=float(item.get("confidence", 0.0)),
+            reasoning=item.get("reasoning", ""),
+        ))
+
+    return sorted(matches, key=lambda m: m.confidence, reverse=True)
+
+
+def _summarise_source(source_path: Path) -> str:
+    """Produce a text summary of the source directory for the model."""
+    lines = []
+    count = 0
+    ext_counts: dict[str, int] = {}
+
+    for p in sorted(source_path.rglob("*")):
+        if not p.is_file():
+            continue
+        if p.name.startswith("._") or p.name == ".DS_Store":
+            continue
+        ext = p.suffix.lower() or "(no ext)"
+        ext_counts[ext] = ext_counts.get(ext, 0) + 1
+        if count < _MAX_SOURCE_FILES:
+            rel = p.relative_to(source_path)
+            lines.append(f"  {rel}  ({p.stat().st_size:,} bytes)")
+        count += 1
+
+    summary = "\n".join(lines)
+    if count > _MAX_SOURCE_FILES:
+        summary += f"\n  ... and {count - _MAX_SOURCE_FILES} more files"
+
+    ext_summary = "  Extensions: " + ", ".join(
+        f"{ext} ({n})" for ext, n in sorted(ext_counts.items(), key=lambda x: -x[1])
+    )
+    return summary + "\n" + ext_summary
+
+
+def _describe_protocols(protocols: dict[str, ImportProtocol]) -> str:
+    lines = []
+    for name, p in protocols.items():
+        lines.append(f"  Protocol: {name}")
+        lines.append(f"    Description: {p.description}")
+        lines.append(f"    Triggers: {p.triggers}")
+        lines.append(f"    Category: {p.category_template}" +
+                     (f" / {p.subcategory_template}" if p.subcategory_template else ""))
+    return "\n".join(lines)

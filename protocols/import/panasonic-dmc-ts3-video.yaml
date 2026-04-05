@@ -1,0 +1,15 @@
+name: panasonic-dmc-ts3-video
+type: import
+version: '1'
+created: '2026-04-05'
+maturity: draft
+description: Import AVCHD video clips from Panasonic DMC-TS3 SD card
+triggers:
+- extensions:
+  - .mts
+category_template: panasonic-dmc-ts3
+subcategory_template: video
+filename_template: '{date}_{time}_{original_name}'
+enrichment_chain: []
+instructions: AVCHD video clips from Panasonic DMC-TS3 Lumix waterproof camera. Ignores
+  AVCHD sidecar files (CPI, MPL, BDM, TDT, TID).

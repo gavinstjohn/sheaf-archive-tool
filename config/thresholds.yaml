@@ -1,0 +1,3 @@
+confidence_threshold: 0.75
+draft_runs_for_probationary: 3
+probationary_runs_for_trusted: 10

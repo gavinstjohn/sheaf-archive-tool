@@ -1,0 +1,2 @@
+[console_scripts]
+sheaf = src.cli:main
