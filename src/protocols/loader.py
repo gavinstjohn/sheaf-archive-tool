@@ -8,15 +8,19 @@ import yaml
 from ..exceptions import ProtocolNotFoundError, ProtocolValidationError
 from .model import (
     EnrichmentProtocol,
+    IdentificationProtocol,
     ImportProtocol,
+    Shape,
     protocol_from_dict,
     protocol_to_dict,
+    shape_from_dict,
+    shape_to_dict,
 )
 
 log = logging.getLogger(__name__)
 
 REQUIRED_FIELDS = {"name", "type", "version", "created", "maturity", "description"}
-VALID_TYPES = {"import", "enrichment"}
+VALID_TYPES = {"import", "enrichment", "identification"}
 VALID_MATURITIES = {"draft", "probationary", "trusted"}
 
 
@@ -40,10 +44,23 @@ def validate_protocol_yaml(data: dict) -> list[str]:
         if not data.get("filename_template"):
             errors.append("Import protocol missing 'filename_template'")
 
+    if data.get("type") == "identification":
+        if not data.get("classification"):
+            errors.append("Identification protocol missing 'classification'")
+
     return errors
 
 
-def load_protocol_file(path: Path) -> ImportProtocol | EnrichmentProtocol:
+def validate_shape_yaml(data: dict) -> list[str]:
+    """Return a list of validation error strings for a shape definition."""
+    errors = []
+    for field in ("name", "description"):
+        if not data.get(field):
+            errors.append(f"Missing required field: {field!r}")
+    return errors
+
+
+def load_protocol_file(path: Path) -> ImportProtocol | EnrichmentProtocol | IdentificationProtocol:
     """Load and validate a single protocol YAML file."""
     with open(path) as f:
         data = yaml.safe_load(f)
@@ -61,6 +78,40 @@ def load_protocol_file(path: Path) -> ImportProtocol | EnrichmentProtocol:
         return protocol_from_dict(data)
     except (KeyError, ValueError) as e:
         raise ProtocolValidationError(f"{path}: {e}") from e
+
+
+def load_shape_file(path: Path) -> Shape:
+    """Load and validate a single shape YAML file."""
+    with open(path) as f:
+        data = yaml.safe_load(f)
+
+    if not isinstance(data, dict):
+        raise ProtocolValidationError(f"{path}: file is empty or not a YAML mapping")
+
+    errors = validate_shape_yaml(data)
+    if errors:
+        raise ProtocolValidationError(
+            f"{path}: validation failed:\n" + "\n".join(f"  - {e}" for e in errors)
+        )
+
+    try:
+        return shape_from_dict(data)
+    except (KeyError, ValueError) as e:
+        raise ProtocolValidationError(f"{path}: {e}") from e
+
+
+def load_shapes(shapes_dir: Path) -> dict[str, Shape]:
+    """Load all shapes from shapes/*.yaml."""
+    result: dict[str, Shape] = {}
+    if not shapes_dir.exists():
+        return result
+    for path in sorted(shapes_dir.glob("*.yaml")):
+        try:
+            s = load_shape_file(path)
+            result[s.name] = s
+        except ProtocolValidationError as e:
+            log.warning("Skipping %s: %s", path, e)
+    return result
 
 
 def load_import_protocols(protocols_dir: Path) -> dict[str, ImportProtocol]:
@@ -99,9 +150,28 @@ def load_enrichment_protocols(protocols_dir: Path) -> dict[str, EnrichmentProtoc
     return result
 
 
+def load_identification_protocols(protocols_dir: Path) -> dict[str, IdentificationProtocol]:
+    """Load all identification protocols from protocols/identification/*.yaml."""
+    result: dict[str, IdentificationProtocol] = {}
+    id_dir = protocols_dir / "identification"
+    if not id_dir.exists():
+        return result
+    for path in sorted(id_dir.glob("*.yaml")):
+        try:
+            p = load_protocol_file(path)
+            if isinstance(p, IdentificationProtocol):
+                result[p.name] = p
+            else:
+                log.warning("Expected identification protocol in %s, got type %r — skipping", path, p.type)
+        except ProtocolValidationError as e:
+            log.warning("Skipping %s: %s", path, e)
+    return result
+
+
 def load_all_protocols(
     protocols_dir: Path,
 ) -> tuple[dict[str, ImportProtocol], dict[str, EnrichmentProtocol]]:
+    """Load import and enrichment protocols. Identification protocols are loaded separately."""
     return (
         load_import_protocols(protocols_dir),
         load_enrichment_protocols(protocols_dir),
@@ -109,7 +179,7 @@ def load_all_protocols(
 
 
 def save_protocol(
-    protocol: ImportProtocol | EnrichmentProtocol,
+    protocol: ImportProtocol | EnrichmentProtocol | IdentificationProtocol,
     protocols_dir: Path,
 ) -> Path:
     """Serialize a protocol to YAML and save it. Returns the path written."""
@@ -123,13 +193,32 @@ def save_protocol(
     return path
 
 
+def save_shape(shape: Shape, shapes_dir: Path) -> Path:
+    """Serialize a shape to YAML and save it. Returns the path written."""
+    shapes_dir.mkdir(parents=True, exist_ok=True)
+    path = shapes_dir / f"{shape.name}.yaml"
+    data = shape_to_dict(shape)
+    with open(path, "w") as f:
+        yaml.dump(data, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+    log.info("Saved shape %r to %s", shape.name, path)
+    return path
+
+
 def get_protocol(
     name: str,
     protocols_dir: Path,
-) -> ImportProtocol | EnrichmentProtocol:
-    """Load a single protocol by name, searching both import/ and enrichment/."""
-    for subdir in ("import", "enrichment"):
+) -> ImportProtocol | EnrichmentProtocol | IdentificationProtocol:
+    """Load a single protocol by name, searching all subdirectories."""
+    for subdir in ("import", "enrichment", "identification"):
         path = protocols_dir / subdir / f"{name}.yaml"
         if path.exists():
             return load_protocol_file(path)
     raise ProtocolNotFoundError(f"Protocol not found: {name!r}")
+
+
+def get_shape(name: str, shapes_dir: Path) -> Shape:
+    """Load a single shape by name."""
+    path = shapes_dir / f"{name}.yaml"
+    if path.exists():
+        return load_shape_file(path)
+    raise ProtocolNotFoundError(f"Shape not found: {name!r}")

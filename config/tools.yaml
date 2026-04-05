@@ -1,0 +1,14 @@
+# config/tools.yaml
+# Auto-managed by Sheaf — tracks external tools, models, and scripts installed for protocols.
+# Each entry records what was installed, by which protocol, and when it was verified.
+# Do not edit manually. Use `sheaf protocols new` or `sheaf protocols edit` to manage.
+#
+# Entry fields:
+#   name         — short identifier used to reference the tool in protocols
+#   type         — ollama_model | system_binary | python_package | custom_script
+#   identifier   — model tag, binary name, package name, or script path
+#   installed_by — protocol name that installed this tool
+#   verified_at  — ISO-8601 datetime of last successful verification
+#   notes        — human-readable description of what this tool does
+
+tools: []

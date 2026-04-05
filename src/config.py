@@ -18,6 +18,8 @@ class Settings:
     db_path: Path
     logs_dir: Path
     protocols_dir: Path
+    shapes_dir: Path = field(default_factory=Path)
+    tools_registry_path: Path = field(default_factory=Path)
     confidence_threshold: float = 0.75
     dry_run: bool = False
 
@@ -67,6 +69,8 @@ def load_settings(
         db_path=project_dir / "db" / "archive.db",
         logs_dir=project_dir / "logs",
         protocols_dir=project_dir / "protocols",
+        shapes_dir=project_dir / "shapes",
+        tools_registry_path=project_dir / "config" / "tools.yaml",
         confidence_threshold=thresholds_cfg.get("confidence_threshold", 0.75),
         draft_runs_for_probationary=thresholds_cfg.get("draft_runs_for_probationary", 3),
         probationary_runs_for_trusted=thresholds_cfg.get("probationary_runs_for_trusted", 10),

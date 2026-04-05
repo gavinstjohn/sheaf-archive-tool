@@ -1,3 +1,15 @@
+"""matcher.py — Match a source path to an import protocol.
+
+Two matching strategies:
+
+1. **Classification-based** (new style): Run the shape → identification pipeline
+   to get a semantic classification (e.g. "camera-roll"), then find import protocols
+   that declare `accepts_classification: camera-roll`.
+
+2. **Trigger-based** (legacy): Ask the model to score all protocols against the source
+   using extension/trigger metadata. Used as a fallback when no shapes are defined or
+   when old-style protocols lack `accepts_classification`.
+"""
 from __future__ import annotations
 
 import json
@@ -18,6 +30,38 @@ class ProtocolMatch:
     protocol: ImportProtocol
     confidence: float      # 0.0 – 1.0
     reasoning: str
+    # If matched via classification pipeline, the classification string
+    classification: str | None = None
+
+
+def match_by_classification(
+    classification: str,
+    import_protocols: dict[str, ImportProtocol],
+    confidence: float = 1.0,
+    reasoning: str = "",
+) -> list[ProtocolMatch]:
+    """Find import protocols that accept a given semantic classification.
+
+    Returns protocols with `accepts_classification` matching the classification string,
+    ordered by maturity (trusted first) then name.
+    """
+    from .model import ProtocolMaturity
+    maturity_order = {
+        ProtocolMaturity.TRUSTED: 0,
+        ProtocolMaturity.PROBATIONARY: 1,
+        ProtocolMaturity.DRAFT: 2,
+    }
+    matches = [
+        ProtocolMatch(
+            protocol=p,
+            confidence=confidence,
+            reasoning=reasoning or f"Accepts classification '{classification}'",
+            classification=classification,
+        )
+        for p in import_protocols.values()
+        if p.accepts_classification == classification
+    ]
+    return sorted(matches, key=lambda m: (maturity_order.get(m.protocol.maturity, 3), m.protocol.name))
 
 
 def match_protocols(
@@ -26,16 +70,24 @@ def match_protocols(
     adapter: BaseAdapter,
     confidence_threshold: float = 0.75,
 ) -> list[ProtocolMatch]:
-    """Ask the model to score each protocol against the source.
+    """Legacy trigger-based matching: ask the model to score protocols against the source.
 
     Returns matches sorted by confidence (highest first).
     Returns an empty list if there are no protocols to match against.
+
+    Only protocols with old-style `triggers` are considered here; protocols that use
+    `accepts_classification` are matched via match_by_classification() instead.
     """
-    if not protocols:
+    # Filter to old-style protocols (those with triggers, no accepts_classification)
+    trigger_protocols = {
+        name: p for name, p in protocols.items()
+        if p.triggers and not p.accepts_classification
+    }
+    if not trigger_protocols:
         return []
 
     source_summary = _summarise_source(source_path)
-    protocol_descriptions = _describe_protocols(protocols)
+    protocol_descriptions = _describe_protocols(trigger_protocols)
 
     prompt = f"""You are evaluating whether any known import protocols match a media source.
 
@@ -76,10 +128,10 @@ Respond with a JSON array only, no other text:
     matches = []
     for item in scores:
         name = item.get("name")
-        if name not in protocols:
+        if name not in trigger_protocols:
             continue
         matches.append(ProtocolMatch(
-            protocol=protocols[name],
+            protocol=trigger_protocols[name],
             confidence=float(item.get("confidence", 0.0)),
             reasoning=item.get("reasoning", ""),
         ))
@@ -92,6 +144,9 @@ def _summarise_source(source_path: Path) -> str:
     lines = []
     count = 0
     ext_counts: dict[str, int] = {}
+
+    if source_path.is_file():
+        return f"Single file: {source_path.name}  ({source_path.stat().st_size:,} bytes)"
 
     for p in sorted(source_path.rglob("*")):
         if not p.is_file():

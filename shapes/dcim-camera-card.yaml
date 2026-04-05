@@ -1,0 +1,7 @@
+name: dcim-camera-card
+description: Camera SD card with DCIM directory layout, optionally with AVCHD video
+  in PRIVATE/
+indicators:
+- dcim_layout: true
+- min_file_count: 1
+is_container: false

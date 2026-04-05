@@ -259,22 +259,57 @@ def cmd_verify(settings, repair: bool = False) -> None:
         print(f"\n{issues} issue(s) found." + (" Repaired where possible." if repair else " Run with --repair to fix where possible."))
 
 
+def cmd_shapes(settings, args) -> None:
+    from .protocols.loader import load_shapes, get_shape
+
+    shapes_cmd = getattr(args, "shapes_cmd", None) or "list"
+
+    if shapes_cmd == "list":
+        shapes = load_shapes(settings.shapes_dir)
+        if not shapes:
+            print("No shapes defined yet. They are created automatically during the import learning flow.")
+            return
+        print(f"{'Name':<30}  {'Container':<10}  Description")
+        print("-" * 80)
+        for s in sorted(shapes.values(), key=lambda x: x.name):
+            container = "yes" if s.is_container else "no"
+            print(f"  {s.name:<28}  {container:<10}  {s.description[:40]}")
+
+    elif shapes_cmd == "show":
+        try:
+            s = get_shape(args.shape_name, settings.shapes_dir)
+        except Exception as e:
+            print(f"Error: {e}")
+            return
+        print(f"Name        : {s.name}")
+        print(f"Description : {s.description}")
+        print(f"Container   : {s.is_container}")
+        if s.indicators:
+            print(f"\nIndicators:")
+            for ind in s.indicators:
+                for key, val in ind.items():
+                    print(f"  {key}: {val}")
+
+
 def cmd_protocols(settings, args) -> None:
-    from .protocols.loader import load_all_protocols, get_protocol
-    from .protocols.model import ImportProtocol
+    from .protocols.loader import load_all_protocols, load_identification_protocols, get_protocol
+    from .protocols.model import ImportProtocol, IdentificationProtocol
 
     proto_cmd = getattr(args, "proto_cmd", None) or "list"
 
     if proto_cmd == "list":
         imports, enrichments = load_all_protocols(settings.protocols_dir)
-        all_protocols = list(imports.values()) + list(enrichments.values())
+        id_protocols = load_identification_protocols(settings.protocols_dir)
+        all_protocols = (
+            list(id_protocols.values()) + list(imports.values()) + list(enrichments.values())
+        )
         if not all_protocols:
-            print("No protocols found. They will be created during `sheaf import`.")
+            print("No protocols found. Run `sheaf protocols new` or `sheaf import <path>` to create one.")
             return
-        print(f"{'Name':<30}  {'Type':<12}  {'Maturity':<14}  Description")
-        print("-" * 90)
+        print(f"{'Name':<30}  {'Type':<14}  {'Maturity':<14}  Description")
+        print("-" * 92)
         for p in sorted(all_protocols, key=lambda x: (x.type, x.name)):
-            print(f"  {p.name:<28}  {p.type:<12}  {p.maturity.value:<14}  {p.description[:40]}")
+            print(f"  {p.name:<28}  {p.type:<14}  {p.maturity.value:<14}  {p.description[:40]}")
 
     elif proto_cmd == "show":
         try:
@@ -292,10 +327,23 @@ def cmd_protocols(settings, args) -> None:
         if p.confidence_threshold is not None:
             print(f"Confidence  : {p.confidence_threshold} (overrides global)")
 
-        if isinstance(p, ImportProtocol):
-            print(f"\nTriggers:")
-            for t in p.triggers:
-                print(f"  {t}")
+        if isinstance(p, IdentificationProtocol):
+            print(f"\nClassification : {p.classification}")
+            print(f"Method         : {p.method}")
+            if p.triggers:
+                print(f"\nTriggered by shapes:")
+                for t in p.triggers:
+                    print(f"  shape: {t.get('shape', t)}")
+            if p.instructions:
+                print(f"\nInstructions:\n{p.instructions}")
+
+        elif isinstance(p, ImportProtocol):
+            if p.accepts_classification:
+                print(f"\nAccepts classification: {p.accepts_classification}")
+            if p.triggers:
+                print(f"\nTriggers (legacy):")
+                for t in p.triggers:
+                    print(f"  {t}")
             print(f"\nCategory    : {p.category_template}")
             if p.subcategory_template:
                 print(f"Subcategory : {p.subcategory_template}")
@@ -311,15 +359,183 @@ def cmd_protocols(settings, args) -> None:
             print(f"\nMedia types : {', '.join(p.media_types) or '(any)'}")
             print(f"Outputs     : {', '.join(p.output_fields) or '(unspecified)'}")
             print(f"Method      : {p.method}")
-            if p.method == "command" and p.command_template:
+            if p.command_template:
                 print(f"Command     : {p.command_template}")
-            elif p.method == "ollama":
-                print(f"Ollama model: {p.ollama_model}")
-                if p.ollama_url:
-                    print(f"Ollama URL  : {p.ollama_url}")
 
         if p.instructions:
             print(f"\nInstructions:\n{p.instructions}")
+
+    elif proto_cmd == "new":
+        _cmd_protocols_new(settings, args)
+
+    elif proto_cmd == "edit":
+        _cmd_protocols_edit(settings, args)
+
+    elif proto_cmd == "explain":
+        _cmd_protocols_explain(settings, args)
+
+    elif proto_cmd == "test":
+        _cmd_protocols_test(settings, args)
+
+    elif proto_cmd == "delete":
+        _cmd_protocols_delete(settings, args)
+
+
+def _cmd_protocols_new(settings, args) -> None:
+    """Start a conversational session to create a new protocol."""
+    from .adapter import load_adapter
+    from .protocols.author import draft_import_protocol, draft_enrichment_protocol
+
+    try:
+        adapter = load_adapter(_PROJECT_ROOT)
+    except Exception as e:
+        print(f"Adapter error: {e}")
+        return
+
+    protocol_type = getattr(args, "protocol_type", None)
+    source_path = getattr(args, "source_path", None)
+
+    # If type not specified, ask
+    if protocol_type is None:
+        if source_path:
+            protocol_type = "import"
+        else:
+            answer = input("Protocol type — import, identification, or enrichment? ").strip().lower()
+            if answer not in ("import", "identification", "enrichment"):
+                print("Enter 'import', 'identification', or 'enrichment'.")
+                return
+            protocol_type = answer
+
+    if protocol_type == "import":
+        if source_path is None:
+            source_path = input("Source path to import from: ").strip()
+            if not source_path:
+                print("Source path is required for import protocols.")
+                return
+        src = Path(source_path).expanduser().resolve()
+        if not src.exists():
+            print(f"Source path not found: {src}")
+            return
+        draft_import_protocol(src, adapter, settings)
+
+    elif protocol_type == "identification":
+        from .protocols.author import draft_identification_protocol
+        draft_identification_protocol(adapter, settings)
+
+    elif protocol_type == "enrichment":
+        # No imported files in standalone mode — use empty list
+        draft_enrichment_protocol([], adapter, settings)
+
+
+def _cmd_protocols_edit(settings, args) -> None:
+    """Re-enter a conversational session to revise an existing protocol."""
+    from .adapter import load_adapter
+    from .protocols.author import edit_protocol
+
+    try:
+        adapter = load_adapter(_PROJECT_ROOT)
+    except Exception as e:
+        print(f"Adapter error: {e}")
+        return
+
+    edit_protocol(args.protocol_name, adapter, settings)
+
+
+def _cmd_protocols_explain(settings, args) -> None:
+    """Get a plain-language explanation of a protocol."""
+    from .adapter import load_adapter
+    from .protocols.author import explain_protocol
+
+    try:
+        adapter = load_adapter(_PROJECT_ROOT)
+    except Exception as e:
+        print(f"Adapter error: {e}")
+        return
+
+    explain_protocol(args.protocol_name, adapter, settings)
+
+
+def _cmd_protocols_test(settings, args) -> None:
+    """Dry-run a protocol against a source or file."""
+    from .protocols.loader import get_protocol
+    from .protocols.model import ImportProtocol, EnrichmentProtocol
+
+    source = Path(args.source).expanduser().resolve()
+
+    try:
+        protocol = get_protocol(args.protocol_name, settings.protocols_dir)
+    except Exception as e:
+        print(f"Error: {e}")
+        return
+
+    if isinstance(protocol, ImportProtocol):
+        if not source.exists():
+            print(f"Source path not found: {source}")
+            return
+        from .protocols.executor import ProtocolExecutor
+        executor = ProtocolExecutor()
+        try:
+            result = executor.plan(source, protocol, settings)
+            print(executor.preview(result, settings.archive_root))
+        except Exception as e:
+            print(f"Error: {e}")
+
+    elif isinstance(protocol, EnrichmentProtocol):
+        if not source.exists():
+            print(f"File not found: {source}")
+            return
+        if protocol.method == "command":
+            from .protocols.executor import EnrichmentContext, _run_command_enrichment
+            from .archive.sidecar import read_sidecar
+            from .jobs.worker import _sidecar_path_for
+            import json
+            rel = str(source.relative_to(settings.archive_root))
+            sidecar_path = _sidecar_path_for(settings.archive_root, rel)
+            sidecar_data = read_sidecar(sidecar_path) if sidecar_path.exists() else {}
+            import sqlite3
+            conn = sqlite3.connect(":memory:")
+            ctx = EnrichmentContext(
+                file_path=source,
+                sidecar_path=sidecar_path,
+                sidecar_data=sidecar_data,
+                protocol=protocol,
+                settings=settings,
+                conn=conn,
+            )
+            try:
+                result = _run_command_enrichment(ctx)
+                print(json.dumps(result, indent=2, default=str))
+            except Exception as e:
+                print(f"Error: {e}")
+            finally:
+                conn.close()
+        else:
+            print(f"Test for method={protocol.method!r} not supported in dry-run mode.")
+
+
+def _cmd_protocols_delete(settings, args) -> None:
+    """Remove a protocol file after confirmation."""
+    from .protocols.loader import get_protocol
+    import shutil
+
+    try:
+        protocol = get_protocol(args.protocol_name, settings.protocols_dir)
+    except Exception as e:
+        print(f"Error: {e}")
+        return
+
+    protocol_path = (settings.protocols_dir / protocol.type / f"{protocol.name}.yaml")
+    if not protocol_path.exists():
+        print(f"Protocol file not found: {protocol_path}")
+        return
+
+    answer = input(f"Delete protocol '{protocol.name}' ({protocol.type}, {protocol.maturity.value})? [y/N] ").strip().lower()
+    if answer != "y":
+        print("Cancelled.")
+        return
+
+    protocol_path.unlink()
+    print(f"Deleted: {protocol_path}")
 
 
 def _resolve_protocol(source_path: Path, settings, conn):
@@ -327,9 +543,18 @@ def _resolve_protocol(source_path: Path, settings, conn):
 
     Returns (ImportProtocol | None, is_new: bool).
     is_new is True when the protocol was just created via the learning flow.
+
+    Matching strategy (in priority order):
+    1. Shape → identification → classification-based match (new-style protocols)
+    2. Trigger-based model match (old-style protocols with 'triggers' field)
+    3. Learning flow to create a new protocol
     """
-    from .protocols.loader import load_import_protocols
-    from .protocols.matcher import match_protocols
+    from .protocols.loader import (
+        load_import_protocols,
+        load_identification_protocols,
+        load_shapes,
+    )
+    from .protocols.matcher import match_protocols, match_by_classification
     from .protocols.author import draft_import_protocol
     from .adapter import load_adapter
     from .exceptions import AdapterError
@@ -341,12 +566,75 @@ def _resolve_protocol(source_path: Path, settings, conn):
         print("Set ANTHROPIC_API_KEY (or configure config/adapter.yaml) to enable automatic matching.")
         return None, False
 
-    protocols = load_import_protocols(settings.protocols_dir)
+    import_protocols = load_import_protocols(settings.protocols_dir)
 
-    if protocols:
-        print(f"Matching source against {len(protocols)} known protocol(s)...")
+    # --- 1. Shape → identification → classification pipeline ---
+    shapes = load_shapes(settings.shapes_dir)
+    id_protocols = load_identification_protocols(settings.protocols_dir)
+
+    classification_ctx: dict = {}  # passed to learning flow if identification ran
+
+    if shapes:
+        print("Analyzing source structure...")
         try:
-            matches = match_protocols(source_path, protocols, adapter, settings.confidence_threshold)
+            from .protocols.classifier import classify_source
+            results = classify_source(
+                source_path, shapes, id_protocols, adapter, settings.confidence_threshold
+            )
+        except Exception as e:
+            log.warning("Classification failed: %s", e)
+            results = []
+
+        if results:
+            if len(results) > 1:
+                # Container source decomposed into multiple units — not yet fully supported
+                print(f"  Source contains {len(results)} logical unit(s).")
+                # TODO: multi-unit import in a future phase; use first for now
+                result = results[0]
+            else:
+                result = results[0]
+
+            if result.shape:
+                print(f"  Shape: {result.shape.name}")
+            if result.classification and not result.needs_user_input:
+                print(f"  Identified: {result.classification} ({result.identification_confidence:.0%})")
+                classification_ctx = {
+                    "classification": result.classification,
+                    "shape": result.shape,
+                    "id_confidence": result.identification_confidence,
+                }
+                # Find import protocols accepting this classification
+                cls_matches = match_by_classification(
+                    result.classification,
+                    import_protocols,
+                    confidence=result.identification_confidence,
+                    reasoning=result.reasoning,
+                )
+                if cls_matches:
+                    best = cls_matches[0]
+                    threshold = best.protocol.confidence_threshold or settings.confidence_threshold
+                    print(f"Best match: {best.protocol.name} (confidence {best.confidence:.0%})")
+                    print(f"  {best.reasoning}")
+                    if best.confidence >= threshold:
+                        from .protocols.model import ProtocolMaturity
+                        if best.protocol.maturity == ProtocolMaturity.TRUSTED:
+                            return best.protocol, False
+                        answer = input(f"\nUse protocol '{best.protocol.name}'? [Y/n] ").strip().lower()
+                        if answer in ("", "y", "yes"):
+                            return best.protocol, False
+            elif result.needs_user_input:
+                print(f"  {result.reasoning}")
+
+    # --- 2. Legacy trigger-based matching (old-style protocols) ---
+    trigger_protocols = {
+        name: p for name, p in import_protocols.items()
+        if p.triggers and not p.accepts_classification
+    }
+    if trigger_protocols:
+        print(f"Matching source against {len(trigger_protocols)} known protocol(s)...")
+        try:
+            matches = match_protocols(source_path, import_protocols, adapter,
+                                      settings.confidence_threshold)
         except Exception as e:
             print(f"Matching failed: {e}")
             matches = []
@@ -362,22 +650,22 @@ def _resolve_protocol(source_path: Path, settings, conn):
                 if best.protocol.maturity == ProtocolMaturity.TRUSTED:
                     return best.protocol, False
 
-                # Draft or probationary: ask for confirmation
                 answer = input(f"\nUse protocol '{best.protocol.name}'? [Y/n] ").strip().lower()
                 if answer in ("", "y", "yes"):
                     return best.protocol, False
-                # User declined — fall through to learning flow
             else:
                 print(f"Confidence {best.confidence:.0%} is below threshold {threshold:.0%}.")
         else:
             print("No existing protocols matched.")
-    else:
+    elif not shapes:
         print("No protocols exist yet.")
 
-    # Enter the learning flow
+    # --- 3. Learning flow ---
     print("\nStarting import learning flow...\n")
     try:
-        protocol = draft_import_protocol(source_path, adapter, settings)
+        protocol = draft_import_protocol(
+            source_path, adapter, settings, classification_ctx=classification_ctx
+        )
     except Exception as e:
         print(f"Learning flow error: {e}")
         return None, False
@@ -427,14 +715,15 @@ def cmd_import(settings, args) -> None:
         print("[dry-run mode — no files will be copied]")
     print()
 
-    actions = executor.plan(source_path, protocol, settings)
+    result = executor.plan(source_path, protocol, settings)
 
-    if not actions:
+    if not result.actions:
         print("No matching files found in source.")
         conn.close()
         return
 
-    print(executor.preview(actions, settings.archive_root))
+    print(executor.preview(result, settings.archive_root))
+    actions = result.actions
 
     if settings.dry_run:
         conn.close()
@@ -879,12 +1168,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fix issues where possible (e.g. remove orphaned DB records).",
     )
 
+    # shapes
+    shapes_p = sub.add_parser("shapes", help="Inspect learned structural shapes.")
+    shapes_sub = shapes_p.add_subparsers(dest="shapes_cmd", metavar="SUBCOMMAND")
+    shapes_sub.add_parser("list", help="List all known shapes.")
+    shapes_show = shapes_sub.add_parser("show", help="Show shape details.")
+    shapes_show.add_argument("shape_name", metavar="NAME")
+
     # protocols
     proto = sub.add_parser("protocols", help="Manage and inspect learned protocols.")
     proto_sub = proto.add_subparsers(dest="proto_cmd", metavar="SUBCOMMAND")
     proto_sub.add_parser("list", help="List all protocols.")
     proto_show = proto_sub.add_parser("show", help="Show protocol details.")
     proto_show.add_argument("protocol_name", metavar="NAME")
+    proto_new = proto_sub.add_parser("new", help="Start a conversational session to create a new protocol.")
+    proto_new.add_argument("--type", dest="protocol_type",
+                           choices=["import", "identification", "enrichment"],
+                           default=None, metavar="TYPE",
+                           help="Protocol type: import, identification, or enrichment.")
+    proto_new.add_argument("--source", dest="source_path", default=None, metavar="PATH",
+                           help="Source path (for import protocols).")
+    proto_edit = proto_sub.add_parser("edit", help="Revise an existing protocol conversationally.")
+    proto_edit.add_argument("protocol_name", metavar="NAME")
+    proto_explain = proto_sub.add_parser("explain", help="Get a plain-language explanation of a protocol.")
+    proto_explain.add_argument("protocol_name", metavar="NAME")
+    proto_test = proto_sub.add_parser("test", help="Dry-run a protocol against a source or file.")
+    proto_test.add_argument("protocol_name", metavar="NAME")
+    proto_test.add_argument("source", metavar="SOURCE",
+                            help="Source path (import protocol) or archive file path (enrichment protocol).")
+    proto_delete = proto_sub.add_parser("delete", help="Remove a protocol (with confirmation).")
+    proto_delete.add_argument("protocol_name", metavar="NAME")
 
     return parser
 
@@ -949,6 +1262,10 @@ def main() -> None:
             cmd_reindex(settings, full=args.full)
         elif args.command == "verify":
             cmd_verify(settings, repair=args.repair)
+        elif args.command == "shapes":
+            if not hasattr(args, "shapes_cmd") or args.shapes_cmd is None:
+                args.shapes_cmd = "list"
+            cmd_shapes(settings, args)
         elif args.command == "protocols":
             if not hasattr(args, "proto_cmd") or args.proto_cmd is None:
                 args.proto_cmd = "list"

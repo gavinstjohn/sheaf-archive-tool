@@ -49,7 +49,14 @@ The **structure** of the archive is fixed and encoded in the framework: director
 
 ### 2.6 Composable Protocols
 
-Protocols are modular units of work. Import protocols and enrichment protocols are separate, composable pieces. An import protocol handles getting media from a source into the archive. It then explicitly calls one or more enrichment protocols to process the imported media. This allows enrichment logic to be reused across many import sources — the same embedding protocol runs regardless of where the file came from.
+Protocols are modular units of work organized into four distinct layers, each answering a different question:
+
+- **Shape**: "What structural pattern does this source match?" Detected cheaply by the framework before any expensive processing.
+- **Identification**: "What does this content represent semantically?" Can sample pages, call vision models, inspect audio — whatever is needed to classify the content. Fires based on structural shape.
+- **Import**: "Where does this go and how is it named?" Given a semantic classification, decides directory structure, filename convention, and enrichment chain. Reusable across sources that produce the same logical type.
+- **Enrichment**: "What can we learn from it?" Runs after filing. Can be light (EXIF extraction) or heavy (transcription, description generation, embedding).
+
+This separation means a scanned notebook arrives as a PDF today and as a folder of JPEGs tomorrow — the same identification and import logic handles both, because what it *is* is independent of what it *looks like* on disk.
 
 ### 2.7 Data Agnosticism
 
@@ -95,12 +102,20 @@ The tool's project directory is version-controlled with git.
 ```
 sheaf/                   # git-tracked
 ├── src/                        # framework source code
-├── protocols/                  # learned import and enrichment protocols
+├── shapes/                     # learned structural shape definitions (expandable)
+│   └── <shape_name>.yaml
+├── protocols/                  # learned protocols, organized by layer
+│   ├── identification/
+│   │   └── <protocol_name>.yaml
 │   ├── import/
+│   │   └── <protocol_name>.yaml
 │   └── enrichment/
+│       └── <protocol_name>.yaml
+├── scripts/                    # custom scripts installed by the SDK builder
 ├── config/                     # adapter config, model settings, thresholds
 │   ├── adapter.yaml            # which model provider, API keys, etc.
-│   └── thresholds.yaml         # confidence thresholds, maturity settings
+│   ├── thresholds.yaml         # confidence thresholds, maturity settings
+│   └── tools.yaml              # registry of installed external tools and models
 ├── db/                         # SQLite database (the index, not git-tracked)
 │   └── archive.db
 ├── logs/                       # operation logs (partitioned by date)
@@ -255,79 +270,182 @@ Incremental reindexing should be lightweight enough to run frequently. Full rein
 
 ## 6. Protocol System
 
-### 6.1 Two Flavors of Protocol
+### 6.1 Four Protocol Layers
 
-**Import protocols** are source-specific. They know how to handle media from a particular device, file format, or source structure. An import protocol's job is to:
+The protocol system has four distinct layers. Each layer is fully learned — none are hardcoded in the framework.
 
-1. Recognize files from its source.
-2. Extract the capture date and any source-specific metadata.
-3. Determine the correct category directory, subcategory (if any), and filename suffix.
-4. Place files into the archive's directory structure.
-5. Create initial `.meta/` sidecar files.
-6. Call one or more enrichment protocols.
+---
 
-**Enrichment protocols** are media-type-general. They process files already in the archive to add metadata. An enrichment protocol's job is to:
+**Shape** — *"What structural pattern does this source match?"*
 
-1. Accept a file that's already in the archive.
-2. Run processing (embedding generation, transcription, tagging, splitting, etc.).
-3. Update the `.meta/` sidecar (and create binary metadata files if needed).
-4. Update the database.
+Shapes are the cheapest possible analysis: pattern matching against the filesystem before any content is examined. They are defined in `shapes/` as data, not code, and grow as the user shows the tool new types of sources.
 
-A single import protocol explicitly declares which enrichment protocols to run after import. Enrichment protocols can also be run independently (e.g., re-enriching old files with a better model).
+A shape captures what makes a structural pattern recognizable:
 
-### 6.2 Protocol Format
+```yaml
+name: image_sequence
+description: A flat directory of images with sequential or date-based filenames
+indicators:
+  - all_same_extension: [.jpg, .jpeg, .png, .tiff, .tif]
+  - min_file_count: 3
+  - filename_pattern: sequential_or_dated
+is_container: false
+```
 
-Every protocol has a **common envelope** — a standard header with:
+The `is_container` flag indicates whether this shape is a leaf (classifiable) or a container (should be decomposed into sub-units before classification). Mixed directories are containers; a folder of images is a leaf.
 
-- `name`: Unique identifier
-- `type`: `import` or `enrichment`
-- `version`: For tracking changes over time
-- `created`: Timestamp of creation
-- `maturity`: Current maturity state (see 6.4)
-- `triggers`: For import protocols, what input characteristics activate this protocol (file extensions, directory structures, device signatures)
-- `enrichment_chain`: For import protocols, the ordered list of enrichment protocols to run after import
-- `confidence_threshold`: Override for the global confidence threshold (optional)
-- `description`: Human-readable summary of what this protocol does
+---
 
-The **body** of the protocol varies by complexity:
+**Identification** — *"What does this content represent semantically?"*
 
-- Simple protocols may be declarative mappings (metadata field → date, extension → category, naming template).
-- Complex protocols may contain executable code or detailed instructions for the frontier model to follow during processing.
+Identification protocols fire on structural shapes and inspect content — sampling pages, calling vision models, reading file headers — to determine what a file or directory actually *is*. They return a semantic classification and confidence score.
 
-### 6.3 Protocol Storage
+Identification protocols declare which shapes they're willing to examine:
 
-Protocols live in the tool's project directory under `protocols/`, organized by type:
+```yaml
+name: scanned-notebook-identifier
+type: identification
+triggers:
+  - shape: image_sequence
+  - shape: single_document
+    extensions: [.pdf, .tiff]
+description: Determines whether a document or image sequence is a scanned notebook
+```
+
+The key design property: a scanned notebook arrives as a PDF today and as a folder of JPEGs tomorrow. The same identification protocol handles both, because it fires on structural shape — not file extension. The semantic classification it returns ("scanned-notebook") is what gets handed to the import layer.
+
+---
+
+**Import** — *"Where does this go and how is it named?"*
+
+Import protocols receive a semantic classification and decide: category directory, subcategory, filename convention, and enrichment chain. They declare what classifications they accept, not what file extensions they handle:
+
+```yaml
+name: scanned-notebook
+type: import
+accepts_classification: scanned-notebook
+category_template: scan
+subcategory_template: notebook
+filename_template: "{date_start}_{date_end}_{original_name}"
+enrichment_chain:
+  - protocol_name: notebook-page-ocr
+  - protocol_name: document-embeddings
+```
+
+The same import protocol handles any physical representation of a scanned notebook, because the identification layer already resolved "what is this?" before import is invoked.
+
+---
+
+**Enrichment** — *"What can we learn from it?"*
+
+Enrichment protocols process files already in the archive. They can be light (EXIF extraction via a shell command) or heavy (OCR, transcription, embedding generation, vision description). Complexity does not determine which layer something belongs to — the layer is determined by *when* it runs relative to filing.
+
+Enrichment protocols execute a shell command that outputs JSON, or invoke the Claude API directly:
+
+```yaml
+name: notebook-page-ocr
+type: enrichment
+media_types: [scan]
+output_fields: [text_content, page_count, languages]
+method: command
+command_template: python3 scripts/ocr_pdf.py "{file_path}"
+```
+
+`method: command` is the universal local execution method. The command can call any tool — a local model, a CLI utility, a custom script — as long as it outputs JSON to stdout. The Claude Code SDK builder installs and verifies whatever tooling the command needs. `method: claude` is available for cases where the user explicitly wants API-based enrichment.
+
+### 6.2 The Shape Library
+
+Shapes live in `shapes/` alongside protocols and grow as the user shows the tool new source types. The framework ships with no hardcoded shapes. The first time a truly new structural pattern is encountered, the learning flow asks the user to describe it, drafts a shape definition, and stores it. Subsequent identification protocols can then reference it.
+
+Shapes are cheap enough to check against every incoming source. They gate which identification protocols run — an identification protocol that handles `image_sequence` will never fire on a `device_directory` source, keeping expensive content inspection targeted.
+
+### 6.3 Recursive Decomposition for Mixed Sources
+
+When `sheaf import` is pointed at a large mixed source (a portable drive, a download folder), the framework recursively decomposes it until every sub-unit either has a clear classification or needs user input:
+
+```
+classify(path):
+  structural_summary = analyze(path)           # cheap: match against shapes/
+
+  best_id = score_identification_protocols(structural_summary)
+  if best_id.confidence ≥ threshold:
+    return [(path, best_id.classification)]    # leaf — done
+
+  if structural_summary.is_container:
+    sub_units = find_logical_groups(path)      # sub-dirs, extension clusters, date groups
+    return flatten([classify(u) for u in sub_units])
+
+  return [(path, NEEDS_USER_INPUT)]            # no match — flag for conversation
+```
+
+`find_logical_groups` is not a simple directory walk. Within a flat mixed directory it clusters by: file extension families, filename date patterns, and directory boundaries. Each cluster becomes an independent classification attempt. The result for a portable drive is a flat list of `(sub-path, classification)` pairs that are each dispatched to their respective import protocols as independent jobs.
+
+The user sees the plan before anything is filed: "Found 3 things — a camera roll (47 photos), a scanned notebook (1 PDF), and an unrecognized audio folder. Import the first two?"
+
+### 6.4 Tool Registry
+
+`config/tools.yaml` is an auto-managed registry of every external tool, model, and script the system has installed to support enrichment protocols. It grows as new enrichment protocols are built and is consulted during protocol authoring so the model knows what is already available.
+
+```yaml
+tools:
+  - name: llava
+    type: ollama_model
+    identifier: llava:latest
+    installed_by: photo-description-local
+    verified_at: "2026-04-05T14:30:00"
+    notes: vision model for image description
+
+  - name: whisper
+    type: python_package
+    identifier: openai-whisper
+    installed_by: audio-transcription
+    verified_at: "2026-04-03T09:12:00"
+
+  - name: ocr_pdf.py
+    type: custom_script
+    identifier: scripts/ocr_pdf.py
+    installed_by: notebook-page-ocr
+    verified_at: "2026-04-04T16:00:00"
+```
+
+Tool types: `ollama_model`, `system_binary`, `python_package`, `custom_script`. When the learning flow determines that new tooling is needed, the Claude Code SDK builder installs and verifies it, then adds an entry to the registry.
+
+### 6.5 Protocol Storage
 
 ```
 sheaf/
+├── shapes/
+│   └── <shape_name>.yaml
 └── protocols/
+    ├── identification/
+    │   └── <protocol_name>.yaml
     ├── import/
     │   └── <protocol_name>.yaml
     └── enrichment/
         └── <protocol_name>.yaml
 ```
 
-### 6.4 Protocol Maturity States
+### 6.6 Protocol Maturity States
 
-Protocols progress through maturity states that determine how much autonomy they have:
+All four protocol types progress through the same maturity states:
 
 - **Draft**: Just created. The model always shows a dry-run preview and asks for user confirmation before executing. Every result is presented for verification.
-- **Probationary**: Has been executed and confirmed a few times. The model still shows results for verification after execution, but does not require pre-execution approval for each file.
+- **Probationary**: Has been executed and confirmed a few times. Executes autonomously but results are shown for user review after each run.
 - **Trusted**: Fully autonomous. Runs without interruption unless something unexpected occurs (errors, confidence below threshold, unrecognized edge cases).
 
-Maturity transitions require explicit user approval. The system should suggest promotion when appropriate ("This protocol has run successfully N times — want to mark it as trusted?").
+Maturity transitions require explicit user approval. The system suggests promotion when appropriate.
 
-### 6.5 Protocol Matching and Confidence
+### 6.7 Confidence and Matching
 
-When the import command encounters new input, the framework asks the frontier model to evaluate all known import protocols against the input. The model assigns a confidence score to each potential match. If the best match exceeds the confidence threshold, that protocol executes. If no match exceeds the threshold, the system enters conversational mode with the user.
+There is a global confidence threshold (configurable in `config/thresholds.yaml`) and per-protocol overrides. The threshold applies at both the identification layer (does this classification meet the bar?) and, for the first stage of matching, at the shape layer (does this source match a known shape?).
 
-There is a global confidence threshold (configurable) and per-protocol threshold overrides for cases where certain protocols need more or less scrutiny.
+If the best identification result falls below threshold, the system enters conversational mode. If no shape matches at all, the framework presents its structural findings to the user and begins the learning flow to define a new shape and identification protocol.
 
-### 6.6 Protocol Introspection
+### 6.8 Protocol Introspection
 
-Protocols must be inspectable via the CLI. The `sheaf protocols show <n>` command presents a clear summary including: protocol name, type, maturity status with run count, trigger conditions, what category/subcategory structure it produces, filename pattern, enrichment chain, and last run date with file count.
+The `sheaf protocols show <name>` command presents a complete summary of any protocol across all four layers: name, type, maturity with run count, trigger conditions, what it produces, what it hands off to, and last run date.
 
-This view should make it immediately clear what activates the protocol, what it does, and what it hands off to.
+The `sheaf protocols explain <name>` command gives a conversational plain-language explanation of what the protocol does and why it was designed that way.
 
 ---
 
@@ -335,57 +453,66 @@ This view should make it immediately clear what activates the protocol, what it 
 
 ### 7.1 Overview
 
-The learning flow is the core interaction pattern of the system. It governs how the tool handles both new import sources and new enrichment needs. The flow has two phases — **import learning** and **enrichment learning** — which typically occur in a single conversational session when a truly new media type is encountered.
+The learning flow is the core interaction pattern of the system. It governs how the tool handles new sources and new enrichment needs. A single conversational session for a genuinely new media type may define all four protocol layers — shape, identification, import, and enrichment — plus any external tooling needed to support them.
 
-### 7.2 The Encounter → Recognize → Execute or Learn Cycle
+### 7.2 The Import Cycle
 
 ```
 User runs: sheaf import /path/to/source
                     │
                     ▼
-        ┌─── Investigate source ───┐
-        │  Read directory structure │
-        │  Sample file types        │
-        │  Check for known patterns │
-        └───────────┬──────────────┘
+        ┌─── Structural analysis ──────────────┐
+        │  Match source against known shapes   │
+        │  Decompose containers recursively    │
+        │  Produce list of (path, shape) units │
+        └───────────┬──────────────────────────┘
                     │
-          ┌─────────▼─────────┐
-          │  Match against     │
-          │  known protocols   │
-          │                    │
-          │  Confidence ≥      │──── YES ──→ Execute protocol
-          │  threshold?        │             (respecting maturity state)
-          └─────────┬──────────┘
+          ┌─────────▼──────────────────────────┐
+          │  Run identification protocols       │
+          │  (filtered to matching shapes)      │
+          │                                     │
+          │  Classification confidence ≥        │──── YES ──→ Dispatch to import protocol
+          │  threshold?                         │             (respecting maturity state)
+          └─────────┬───────────────────────────┘
                     │ NO
                     ▼
           Enter conversational mode
-          with user
+          (may define new shape + identification
+           + import + enrichment protocols)
 ```
 
-### 7.3 Import Learning Conversation
+### 7.3 Learning Conversation for a New Media Type
 
-When the system encounters an unrecognized source, it enters a conversational session:
+When the system cannot classify a source, it enters a conversational session. A fully new media type typically results in all four layers being defined:
 
-1. **Investigation**: The model examines the source — directory structure, file types, sample filenames, any available metadata. It presents its findings to the user.
-2. **Discussion**: The model asks the user how this media should be imported. What category does it belong to? What should the filenames look like? Where do timestamps come from? Does it need subcategories? The user provides high-level guidance.
-3. **Protocol drafting**: The model writes an import protocol based on the discussion. It presents a dry-run preview showing how sample files would be imported.
-4. **Confirmation**: The user reviews the preview and confirms, adjusts, or rejects. The model iterates until the user is satisfied.
-5. **Execution**: The protocol runs in draft maturity state. Results are presented for verification.
+1. **Structural investigation**: The model examines the source — directory layout, file types, filename patterns, any available metadata. It presents its findings and checks whether any existing shapes match.
 
-### 7.4 Enrichment Learning Conversation
+2. **Shape definition** (if needed): If the source doesn't match any known shape, the model proposes one: "This looks like a flat directory of sequentially named images — I'll call that `image_sequence`. Does that make sense?" The shape is stored in `shapes/`.
 
-After import is settled, the conversation continues into enrichment:
+3. **Identification protocol**: The model determines how to classify the content. For a simple case (DCIM layout clearly means camera roll) this may be trivial. For ambiguous cases (is this PDF a notebook or a receipt?), it designs a content sampling approach — extracting pages, calling a vision model — and drafts an identification protocol.
 
-1. **Precedent check**: The model reviews what enrichment protocols exist and which have been applied to similar media types. It presents suggestions: "We've run these enrichment steps on similar files before — should we do the same here?"
-2. **Discussion**: The user confirms, modifies, or requests new enrichment steps. For genuinely new media types, the user describes what kind of analysis would be useful.
-3. **Protocol drafting**: For new enrichment steps, the model writes enrichment protocols. For existing ones, it simply adds them to the import protocol's enrichment chain.
-4. **Confirmation**: The user reviews and approves.
-5. **Execution or queuing**: Enrichment jobs are queued and run asynchronously. Results are resurfaced for review when complete.
+4. **Import protocol**: With classification settled, the model asks how files should be filed: category, subcategory, filename convention, date source. It previews the result with sample files and iterates until confirmed.
+
+5. **Enrichment protocol(s)**: After import is defined, the conversation turns to enrichment. The model checks existing enrichment protocols for precedent, suggests applicable ones, and drafts new ones where needed. For enrichment that requires new tooling (a model, a CLI tool, a custom script), the model proposes installing it: "This protocol needs X — want me to set that up?" On confirmation, the Claude Code SDK builder installs and verifies the tooling and returns a `command_template`.
+
+6. **Execution**: Import runs in draft maturity. Results are shown for verification before the session closes.
+
+### 7.4 The Claude Code SDK Builder
+
+When enrichment protocol setup requires installing external tooling — a local model, a Python package, a system binary, or a custom script — the conversational session invokes a Claude Code SDK agent as a tool. The agent:
+
+- Installs whatever is needed using the system's package manager, pip, or other tooling.
+- Writes and tests any custom scripts.
+- Verifies that the tool works correctly on a sample file.
+- Returns a verified `command_template` and a list of tool registry entries to add to `config/tools.yaml`.
+
+The SDK agent's output streams inline to the terminal so the user can watch it work. The framework is tool-agnostic — the SDK agent can install anything; the enrichment protocol only cares that its `command_template` outputs valid JSON.
 
 ### 7.5 Self-Verification and Debugging
 
 Throughout the learning flow and during all protocol execution:
 
+- After saving an enrichment protocol, the system automatically runs it against a sample file and presents the output: "Here's what this produces — does it look right?"
 - The model actively checks results against what was agreed upon: "You said the filenames should look like X — here's what I produced. Does this match?"
 - If a protocol fails during execution, the model attempts to diagnose the issue and fix it autonomously. If it cannot resolve the issue, it resurfaces the problem to the user with context.
 - New and probationary protocols always include result verification. The model presents a sample of outputs for the user to confirm.
@@ -393,7 +520,9 @@ Throughout the learning flow and during all protocol execution:
 
 ### 7.6 Protocol Evolution
 
-Protocols are living documents. As the user encounters edge cases or changes preferences, existing protocols can be revised through the same conversational process. The model can suggest protocol updates when it notices patterns: "The last few imports from this source had files I hadn't seen before — should I update the protocol to handle these?"
+Protocols are living documents. As the user encounters edge cases or changes preferences, existing protocols can be revised through the same conversational process (`sheaf protocols edit <name>`). The model can suggest protocol updates when it notices patterns: "The last few imports from this source had files I hadn't seen before — should I update the protocol to handle these?"
+
+Shapes can also evolve. If an existing shape definition no longer accurately describes what the user is seeing, it can be updated through the same editing flow.
 
 ---
 
@@ -572,12 +701,20 @@ Quick dashboard of the archive:
 
 #### `sheaf protocols`
 
-Manage and inspect learned protocols.
+Manage and inspect learned protocols across all four layers.
 
-- `sheaf protocols list`: Show all protocols with type, maturity, and last run date.
-- `sheaf protocols show <name>`: Detailed view of a protocol (see Section 6.6).
-- `sheaf protocols edit <name>`: Open a protocol for editing (enters chat mode for guided revision).
+- `sheaf protocols list`: Show all protocols (all types) with maturity and last run date.
+- `sheaf protocols show <name>`: Structured summary of a protocol.
+- `sheaf protocols explain <name>`: Conversational plain-language explanation of what a protocol does and why.
+- `sheaf protocols new [--type TYPE] [--source PATH]`: Start a conversational session to create a new protocol. `TYPE` is one of `identification`, `import`, or `enrichment`. For import protocols, `--source` points at a sample source to investigate.
+- `sheaf protocols edit <name>`: Re-enter a conversational session to revise an existing protocol. The model is seeded with the current definition and proposes changes based on what the user describes.
+- `sheaf protocols test <name> <source>`: Dry-run a protocol without making changes. For import protocols, shows the preview filing table. For enrichment protocols, runs against a sample file and shows the raw output.
 - `sheaf protocols delete <name>`: Remove a protocol (with confirmation).
+
+Shapes are managed separately:
+
+- `sheaf shapes list`: Show all known structural shapes.
+- `sheaf shapes show <name>`: Show a shape definition.
 
 #### `sheaf verify`
 
@@ -703,7 +840,20 @@ adapter.capabilities → { ... }
 
 All complexity lives behind this interface. The Claude adapter knows about Anthropic's API format, authentication, and quirks. A future adapter for another provider would handle theirs. The framework only ever calls `adapter.chat()`.
 
-### 13.4 v1 Implementation
+### 13.4 Claude Code SDK Builder
+
+For protocol setup that requires installing external tooling, the conversational session has access to a `build_protocol_tooling` tool that spawns a Claude Code SDK agent. This is a distinct capability from the frontier model adapter: the adapter handles conversational turns, while the SDK builder handles agentic execution with full tool access (shell commands, file writes, package installation).
+
+The SDK builder:
+- Receives a task description, media context, and the current tool registry.
+- Spawns a Claude Code SDK agent with `acceptEdits` permission mode and a restricted tool set (`Bash`, `Read`, `Write`, `Edit`).
+- Streams the agent's output inline to the terminal during execution.
+- Returns a verified `command_template` plus new tool registry entries.
+- Updates `config/tools.yaml` with the installed tools.
+
+The framework is entirely tool-agnostic at the enrichment layer — any model, binary, package, or script can be installed through this mechanism. The only contract is that the resulting `command_template` outputs valid JSON to stdout.
+
+### 13.5 v1 Implementation
 
 For v1, only the Claude adapter is built. The abstract interface is defined so that building additional adapters in the future is straightforward — the contract a new adapter must fulfill is clear and documented.
 
@@ -715,20 +865,24 @@ For v1, only the Claude adapter is built. The abstract interface is defined so t
 
 These are the areas that need hands-on experimentation before the design can be fully finalized:
 
-1. **Embedding storage**: Experiment with embedding dimensionality, model choice, and resulting file sizes. Validate that binary sidecar files in `.meta/` are practical at scale. Establish the practical tradeoff between embedding quality and storage/processing cost.
+1. **Shape library bootstrap**: Define the initial set of shapes through real imports rather than speculation. Each new import type encountered in practice should produce a shape definition. Let the library grow organically.
 
-2. **Local model selection**: Evaluate local models for each class of enrichment task — text recognition, content description, audio transcription, embedding generation. Prioritize accuracy over speed.
+2. **Identification protocol design**: Build 2-3 identification protocols for real media types (camera roll, scanned document, audio session) and see what the format needs to support. The distinction between "trivial identification" (DCIM layout = camera roll, no content inspection needed) and "content-sampling identification" (PDF = ???, needs page inspection) should emerge from real cases.
 
-3. **Protocol format**: Build 2-3 protocols by hand for different media types and see what format works. Let the shape of real protocols inform the standard format.
+3. **Recursive decomposition heuristics**: Test `find_logical_groups` against real mixed sources. The clustering logic (by extension family, date patterns, directory boundaries) needs tuning against actual portable drive contents.
 
-4. **Conversational UX**: Prototype the CLI chat experience for the import learning flow. Determine how much context the model needs, how tool use works in practice, and how confirmation flows should feel.
+4. **Embedding storage**: Experiment with embedding dimensionality, model choice, and resulting file sizes. Validate that binary sidecar files in `.meta/` are practical at scale.
 
-5. **Confidence threshold calibration**: Run the protocol matching system against a variety of inputs and tune the threshold. Too low = the system acts on bad matches. Too high = the system asks the user too often.
+5. **Local model selection**: Evaluate local models for each class of enrichment task — OCR, content description, audio transcription, embedding generation. Prioritize accuracy over speed.
+
+6. **Confidence threshold calibration**: Tune thresholds at both the shape-matching and identification layers. Too low = acts on bad classifications. Too high = asks the user too often.
 
 ### 14.2 Open Questions
 
-- **Database schema for embeddings**: Should the embeddings table support multiple embeddings per file (e.g., different models, different regions of a file)?
-- **Protocol body format**: How much should be declarative YAML vs. executable code vs. natural language instructions for the model? Real usage will determine this.
-- **Thumbnail generation**: Should the import pipeline generate thumbnails for the GUI, or should the GUI generate them on-the-fly? Pre-generation is faster at browse time but adds to import time and storage.
+- **Identification protocol scope**: Does one identification protocol handle a single media type (notebook identifier, receipt identifier) or can one protocol return multiple possible classifications with different confidences? The latter is more powerful but harder to author.
+- **Shape vs. identification boundary**: For very clear structural signals (DCIM layout), should identification be skipped entirely and the import protocol dispatched directly from shape matching? Or should identification always run, even if trivially fast?
+- **Per-file vs. per-source classification**: Identification currently operates on a unit (a directory or file). For mixed flat directories, `find_logical_groups` clusters by extension before identification runs. Should identification protocols ever be asked to classify a heterogeneous set of files and route them differently, or is pre-clustering always sufficient?
+- **Database schema for embeddings**: Should the embeddings table support multiple embeddings per file (e.g., different models, different regions of a document)?
+- **Thumbnail generation**: Should the import pipeline generate thumbnails, or should the GUI generate them on-the-fly? Pre-generation is faster at browse time but adds to import time and storage.
 - **Maturity promotion thresholds**: How many successful runs before suggesting promotion from draft to probationary, or probationary to trusted? Should this be configurable per protocol?
-- **Multi-file enrichment protocols**: Some enrichment operates on one file and produces many. Others are one-to-one. Does the protocol format need to explicitly handle this distinction, or is it just an implementation detail?
+- **Multi-file enrichment protocols**: Some enrichment operates on one file and produces many outputs (a PDF that gets split into per-page records). Does the protocol format need to handle this explicitly?

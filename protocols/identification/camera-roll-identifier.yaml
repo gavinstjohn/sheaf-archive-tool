@@ -1,0 +1,10 @@
+name: camera-roll-identifier
+type: identification
+version: '1'
+created: '2026-04-05'
+maturity: draft
+description: Identifies camera SD cards (DCIM layout) as camera-roll sources
+triggers:
+- shape: dcim-camera-card
+classification: camera-roll
+method: heuristic

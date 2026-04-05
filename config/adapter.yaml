@@ -1,5 +1,5 @@
 # Sheaf adapter configuration
-archive_root: /tmp/sheaf-test-archive
+archive_root: /home/gsj/projects/claude/sheaf/test_data/sample_archive
 provider: claude
 model: claude-opus-4-6
 api_key_env: ANTHROPIC_API_KEY

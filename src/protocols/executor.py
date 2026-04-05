@@ -46,6 +46,16 @@ class PlannedAction:
 
 
 @dataclass
+class PlanResult:
+    """Output of ProtocolExecutor.plan() — actions to take plus what was filtered out."""
+    actions: list[PlannedAction]
+    # Files skipped because their extension wasn't in the protocol's triggers.
+    # Key: lowercase extension (e.g. ".mts"), value: count.
+    # Empty if no trigger extensions are defined (protocol accepts all files).
+    skipped_extensions: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
 class ExecutionResult:
     files_copied: int = 0
     files_skipped: int = 0
@@ -62,14 +72,28 @@ class ProtocolExecutor:
         source_path: Path,
         protocol: "ImportProtocol",
         settings: "Settings",
-    ) -> list[PlannedAction]:
-        """Walk source_path, apply the protocol, and return a list of planned actions.
+    ) -> PlanResult:
+        """Walk source_path, apply the protocol, and return a PlanResult.
 
         No filesystem changes are made.
         """
         extensions = _trigger_extensions(protocol)
         actions: list[PlannedAction] = []
+        skipped_extensions: dict[str, int] = {}
         index = 0
+
+        # Pre-scan for source-level camera EXIF only when the protocol needs it.
+        # Files like AVCHD .MTS often lack camera model in their own EXIF; inheriting
+        # from siblings on the same card (e.g., JPGs) fills the gap automatically.
+        templates = " ".join(filter(None, [
+            protocol.category_template,
+            protocol.subcategory_template,
+            protocol.filename_template,
+        ]))
+        if "{camera_" in templates:
+            source_make, source_model = _collect_source_camera_exif(source_path)
+        else:
+            source_make = source_model = ""
 
         for src_file in sorted(source_path.rglob("*")):
             if not src_file.is_file():
@@ -79,55 +103,74 @@ class ProtocolExecutor:
                 continue
             if extensions and src_file.suffix.lower() not in extensions:
                 log.debug("Skipping %s (extension not in triggers)", src_file.name)
+                ext = src_file.suffix.lower() or "(no ext)"
+                skipped_extensions[ext] = skipped_extensions.get(ext, 0) + 1
                 continue
 
-            cap_date, cap_time = _extract_date_and_time(src_file)
+            exif = _extract_exif_data(src_file)
 
             ctx = _TemplateContext(
-                date=cap_date.strftime("%Y%m%d"),
-                time=cap_time or "",
+                date=exif.capture_date.strftime("%Y%m%d"),
+                time=exif.capture_time or "",
                 original_name=src_file.stem,
                 original_filename=src_file.name,
                 extension=src_file.suffix.lstrip(".").lower(),
                 index=index,
+                camera_make=exif.camera_make or source_make,
+                camera_model=exif.camera_model or source_model,
             )
 
             category = ctx.render(protocol.category_template)
             subcategory = ctx.render(protocol.subcategory_template) if protocol.subcategory_template else None
             dest_filename = ctx.render(protocol.filename_template) + src_file.suffix
 
-            dest = media_path(settings.archive_root, cap_date, category, subcategory, dest_filename)
-            sidecar = meta_path(settings.archive_root, cap_date, category, subcategory, dest_filename)
+            dest = media_path(settings.archive_root, exif.capture_date, category, subcategory, dest_filename)
+            sidecar = meta_path(settings.archive_root, exif.capture_date, category, subcategory, dest_filename)
 
             actions.append(PlannedAction(
                 source_file=src_file,
                 dest_file=dest,
                 meta_file=sidecar,
-                capture_date=cap_date,
-                capture_time=cap_time,
+                capture_date=exif.capture_date,
+                capture_time=exif.capture_time,
                 category=category,
                 subcategory=subcategory,
                 dest_filename=dest_filename,
             ))
             index += 1
 
-        return actions
+        return PlanResult(actions=actions, skipped_extensions=skipped_extensions)
 
-    def preview(self, actions: list[PlannedAction], archive_root: Path) -> str:
+    def preview(self, result: PlanResult, archive_root: Path) -> str:
         """Return a human-readable table of planned actions."""
-        if not actions:
-            return "No files to import."
+        actions = result.actions
 
-        lines = [
-            f"  {'Source':<40}  {'Destination':<60}  {'Date'}",
-            "  " + "-" * 108,
-        ]
-        for a in actions:
-            src = str(a.source_file)[-40:]
-            dest = str(a.dest_file.relative_to(archive_root))[-60:]
-            lines.append(f"  {src:<40}  {dest:<60}  {a.capture_date}")
+        if not actions and not result.skipped_extensions:
+            return "No files found in source."
 
-        lines.append(f"\n  {len(actions)} file(s) would be imported.")
+        lines = []
+
+        if actions:
+            lines += [
+                f"  {'Source':<40}  {'Destination':<60}  {'Date'}",
+                "  " + "-" * 108,
+            ]
+            for a in actions:
+                src = str(a.source_file)[-40:]
+                dest = str(a.dest_file.relative_to(archive_root))[-60:]
+                lines.append(f"  {src:<40}  {dest:<60}  {a.capture_date}")
+            lines.append(f"\n  {len(actions)} file(s) would be imported.")
+        else:
+            lines.append("  No files match the protocol's extension triggers.")
+
+        if result.skipped_extensions:
+            total_skipped = sum(result.skipped_extensions.values())
+            ext_summary = ", ".join(
+                f"{ext} ×{n}"
+                for ext, n in sorted(result.skipped_extensions.items(), key=lambda x: -x[1])
+            )
+            lines.append(f"  {total_skipped} file(s) not in protocol (not imported): {ext_summary}")
+
         return "\n".join(lines)
 
     def execute(
@@ -217,41 +260,61 @@ _EXIF_TAGS = ["DateTimeOriginal", "CreateDate", "MediaCreateDate", "FileModifyDa
 _FILENAME_DATE_RE = re.compile(r"(\d{8})(?:_(\d{4}))?")
 
 
-def _extract_date_and_time(path: Path) -> tuple[date, str | None]:
-    """Return (capture_date, capture_time_HHMM_or_None) for a file.
+def _extract_exif_data(path: Path) -> _ExifData:
+    """Return _ExifData for a file, using EXIF → filename pattern → mtime fallbacks.
 
-    Strategy order:
-      1. EXIF via exiftool (if available)
-      2. YYYYMMDD[_HHMM] pattern in filename
-      3. File modification time
+    Camera make/model are empty strings when not available via EXIF.
     """
-    # 1. exiftool
-    result = _try_exiftool(path)
-    if result:
-        return result
+    # 1. exiftool (date + camera info)
+    exif = _try_exiftool(path)
+    if exif:
+        return exif
 
-    # 2. Filename pattern
+    # 2. Filename pattern (date only; no camera info)
     m = _FILENAME_DATE_RE.search(path.stem)
     if m:
         try:
             d = datetime.strptime(m.group(1), "%Y%m%d").date()
             t = m.group(2)  # "HHMM" or None
-            return d, t
+            return _ExifData(capture_date=d, capture_time=t, camera_make="", camera_model="")
         except ValueError:
             pass
 
-    # 3. File mtime
+    # 3. File mtime (date only; no camera info)
     mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
     log.debug("Using mtime for %s: %s", path.name, mtime.date())
-    return mtime.date(), mtime.strftime("%H%M")
+    return _ExifData(
+        capture_date=mtime.date(),
+        capture_time=mtime.strftime("%H%M"),
+        camera_make="",
+        camera_model="",
+    )
 
 
-def _try_exiftool(path: Path) -> tuple[date, str | None] | None:
-    """Try to extract capture date/time via exiftool. Returns None if unavailable."""
+@dataclass
+class _ExifData:
+    capture_date: date
+    capture_time: str | None   # "HHMM" or None
+    camera_make: str           # normalized for directory use, "" if missing
+    camera_model: str          # normalized for directory use, "" if missing
+
+
+def _normalize_camera_tag(value: str) -> str:
+    """Lowercase and replace spaces/special chars for safe directory names."""
+    return re.sub(r"[^a-z0-9]+", "-", value.strip().lower()).strip("-")
+
+
+def _try_exiftool(path: Path) -> _ExifData | None:
+    """Try to extract capture date/time and camera info via exiftool.
+
+    Returns None if exiftool is unavailable or fails.
+    """
     try:
         result = subprocess.run(
-            ["exiftool", "-json", "-DateTimeOriginal", "-CreateDate",
-             "-MediaCreateDate", "-FileModifyDate", str(path)],
+            ["exiftool", "-json",
+             "-DateTimeOriginal", "-CreateDate", "-MediaCreateDate", "-FileModifyDate",
+             "-Make", "-Model",
+             str(path)],
             capture_output=True, text=True, timeout=10,
         )
         if result.returncode != 0:
@@ -260,17 +323,65 @@ def _try_exiftool(path: Path) -> tuple[date, str | None] | None:
         if not data:
             return None
         tags = data[0]
+
+        cap_date: date | None = None
+        cap_time: str | None = None
         for tag in _EXIF_TAGS:
             val = tags.get(tag)
             if val and val != "0000:00:00 00:00:00":
                 try:
                     dt = datetime.strptime(val[:19], "%Y:%m:%d %H:%M:%S")
-                    return dt.date(), dt.strftime("%H%M")
+                    cap_date = dt.date()
+                    cap_time = dt.strftime("%H%M")
+                    break
                 except ValueError:
                     continue
+
+        if cap_date is None:
+            return None
+
+        make = _normalize_camera_tag(tags.get("Make", "") or "")
+        model = _normalize_camera_tag(tags.get("Model", "") or "")
+        return _ExifData(
+            capture_date=cap_date,
+            capture_time=cap_time,
+            camera_make=make,
+            camera_model=model,
+        )
     except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError):
         pass
     return None
+
+
+def _collect_source_camera_exif(source_path: Path, limit: int = 20) -> tuple[str, str]:
+    """Scan files in source_path to find a camera make and model.
+
+    Returns (camera_make, camera_model), either of which may be empty.
+    Stops as soon as a complete make+model pair is found, or after `limit` files.
+    Used as source-level fallback for files that lack their own camera EXIF (e.g. .MTS).
+    """
+    best_make = ""
+    best_model = ""
+    checked = 0
+
+    for path in sorted(source_path.rglob("*")):
+        if not path.is_file():
+            continue
+        if any(skip(path.name) for skip in _SKIP_PATTERNS):
+            continue
+        exif = _try_exiftool(path)
+        if exif:
+            if not best_make and exif.camera_make:
+                best_make = exif.camera_make
+            if not best_model and exif.camera_model:
+                best_model = exif.camera_model
+            if best_make and best_model:
+                break
+        checked += 1
+        if checked >= limit:
+            break
+
+    return best_make, best_model
 
 
 # ---------------------------------------------------------------------------
@@ -278,10 +389,17 @@ def _try_exiftool(path: Path) -> tuple[date, str | None] | None:
 # ---------------------------------------------------------------------------
 
 def _trigger_extensions(protocol: "ImportProtocol") -> set[str]:
-    """Collect all file extensions declared in the protocol's triggers.
+    """Return the set of extensions this protocol should import.
 
-    Returns an empty set if no extension triggers are declared (match all files).
+    Checks include_extensions first (the explicit, new-style field), then falls
+    back to reading extensions out of the legacy triggers list. Returns an empty
+    set if no extension filter is declared, meaning the protocol accepts all files.
     """
+    if protocol.include_extensions:
+        return {
+            ext.lower() if ext.startswith(".") else f".{ext.lower()}"
+            for ext in protocol.include_extensions
+        }
     exts: set[str] = set()
     for trigger in protocol.triggers:
         for ext in trigger.get("extensions", trigger.get("extension", [])):
@@ -304,7 +422,10 @@ class _TemplateContext:
         original_filename: str,
         extension: str,
         index: int,
+        camera_make: str = "",
+        camera_model: str = "",
     ) -> None:
+        make_model = "-".join(filter(None, [camera_make, camera_model]))
         self._vars = {
             "date": date,
             "time": time,
@@ -314,6 +435,9 @@ class _TemplateContext:
             "index": index,
             "index2": f"{index:02d}",
             "index4": f"{index:04d}",
+            "camera_make": camera_make,
+            "camera_model": camera_model,
+            "camera_make_model": make_model,
         }
 
     def render(self, template: str) -> str:
@@ -345,7 +469,7 @@ class EnrichmentContext:
 def run_enrichment(ctx: EnrichmentContext, adapter: "BaseAdapter | None" = None) -> dict:
     """Execute an enrichment protocol against a single file.
 
-    Dispatches to the appropriate execution method (command, ollama, claude),
+    Dispatches to the appropriate execution method (command or claude),
     updates the sidecar, and indexes the enrichment data in the database.
 
     Returns the enrichment data dict.
@@ -357,14 +481,12 @@ def run_enrichment(ctx: EnrichmentContext, adapter: "BaseAdapter | None" = None)
 
     if method == "command":
         enrichment_data = _run_command_enrichment(ctx)
-    elif method == "ollama":
-        enrichment_data = _run_ollama_enrichment(ctx)
     elif method == "claude":
         if adapter is None:
             raise ValueError("Claude adapter required for method='claude' but none provided")
         enrichment_data = _run_claude_enrichment(ctx, adapter)
     else:
-        raise ValueError(f"Unknown enrichment method: {method!r} (expected command, ollama, or claude)")
+        raise ValueError(f"Unknown enrichment method: {method!r} (expected 'command' or 'claude')")
 
     # Update sidecar
     rel_path = str(ctx.file_path.relative_to(ctx.settings.archive_root))
@@ -409,42 +531,6 @@ def _run_command_enrichment(ctx: EnrichmentContext) -> dict:
         )
     return _parse_json_response(result.stdout)
 
-
-def _run_ollama_enrichment(ctx: EnrichmentContext) -> dict:
-    """Call a local Ollama model and parse the response as JSON."""
-    import urllib.request as _urllib
-    import base64
-
-    if not ctx.protocol.ollama_model:
-        raise ValueError("ollama_model is required for method='ollama'")
-
-    base_url = ctx.protocol.ollama_url.rstrip("/") or "http://localhost:11434"
-
-    prompt = (ctx.protocol.instructions or
-              f"Analyze this file and return JSON with these fields: {ctx.protocol.output_fields}. "
-              f"Return ONLY valid JSON.")
-
-    payload: dict = {
-        "model": ctx.protocol.ollama_model,
-        "prompt": prompt,
-        "stream": False,
-        "format": "json",
-    }
-
-    # Attach image if it's a supported image type
-    if ctx.file_path.suffix.lower() in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"):
-        payload["images"] = [base64.b64encode(ctx.file_path.read_bytes()).decode()]
-
-    data = json.dumps(payload).encode()
-    req = _urllib.Request(
-        f"{base_url}/api/generate",
-        data=data,
-        headers={"Content-Type": "application/json"},
-    )
-    with _urllib.urlopen(req, timeout=300) as resp:
-        result = json.loads(resp.read())
-
-    return _parse_json_response(result.get("response", "{}"))
 
 
 def _run_claude_enrichment(ctx: EnrichmentContext, adapter: "BaseAdapter") -> dict:

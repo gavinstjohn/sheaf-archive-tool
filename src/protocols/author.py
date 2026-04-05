@@ -11,8 +11,21 @@ import yaml
 from ..adapter.base import BaseAdapter, ToolDefinition
 from ..chat.session import ChatSession, readline_chat
 from ..exceptions import ProtocolValidationError
-from .loader import load_all_protocols, save_protocol, validate_protocol_yaml
-from .model import ImportProtocol, protocol_from_dict
+from .loader import (
+    load_all_protocols,
+    load_identification_protocols,
+    load_shapes,
+    save_protocol,
+    save_shape,
+    validate_protocol_yaml,
+    validate_shape_yaml,
+)
+from .model import IdentificationProtocol, ImportProtocol, protocol_from_dict, shape_from_dict
+from .tools_registry import (
+    add_tools,
+    format_registry_for_prompt,
+    load_tools,
+)
 
 if TYPE_CHECKING:
     from ..config import Settings
@@ -22,6 +35,10 @@ log = logging.getLogger(__name__)
 _MAX_LIST_FILES = 50
 _MAX_EXIF_FILES = 3
 
+
+# ---------------------------------------------------------------------------
+# Enrichment protocol authoring
+# ---------------------------------------------------------------------------
 
 def draft_enrichment_protocol(
     imported_files: list[Path],
@@ -39,7 +56,10 @@ def draft_enrichment_protocol(
     """
     from .model import EnrichmentProtocol
 
-    system_prompt = _ENRICHMENT_SYSTEM_PROMPT
+    tools = load_tools(settings.tools_registry_path)
+    registry_summary = format_registry_for_prompt(tools)
+    system_prompt = _build_enrichment_system_prompt(registry_summary)
+
     session = ChatSession(adapter, system=system_prompt, max_tokens=8096)
     saved: list[EnrichmentProtocol] = []
 
@@ -51,8 +71,7 @@ def draft_enrichment_protocol(
         f"I just imported {total} file(s). Sample filenames: {sample_names}\n\n"
         "Please help me set up enrichment protocols for them. "
         "Use list_sample_files and read_file_metadata to understand the media, "
-        "then suggest what enrichment steps would be valuable. "
-        "Prefer local execution methods (command or ollama) over the Claude API."
+        "then suggest what enrichment steps would be valuable."
     )
 
     print(f"\nSheaf: {opening}\n")
@@ -70,8 +89,6 @@ def _register_enrichment_tools(
     settings: "Settings",
     saved: list,
 ) -> None:
-    from ..adapter.base import ToolDefinition
-
     # 1. List sample imported files
     session.register_tool(
         ToolDefinition(
@@ -104,7 +121,7 @@ def _register_enrichment_tools(
         lambda args: _tool_read_file_metadata(imported_files, settings, args),
     )
 
-    # 3. List existing enrichment protocols
+    # 3. List existing protocols
     session.register_tool(
         ToolDefinition(
             name="list_existing_protocols",
@@ -114,13 +131,49 @@ def _register_enrichment_tools(
         lambda _: _tool_list_protocols(settings),
     )
 
-    # 4. Save enrichment protocol
+    # 4. Build tooling via Claude Code SDK agent
+    session.register_tool(
+        ToolDefinition(
+            name="build_protocol_tooling",
+            description=(
+                "Spawn a Claude Code agent to install, configure, and verify whatever "
+                "external tooling this enrichment protocol needs — any model, CLI tool, "
+                "Python package, or custom script. Use this when the required tooling is "
+                "not already in the tool registry. Always ask the user for confirmation "
+                "before calling this tool."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": (
+                            "Clear description of what needs to be installed/built and "
+                            "what the resulting command should do."
+                        ),
+                    },
+                    "media_context": {
+                        "type": "string",
+                        "description": (
+                            "File type, expected input format, and the JSON output fields "
+                            "the command_template should produce."
+                        ),
+                    },
+                },
+                "required": ["task", "media_context"],
+            },
+        ),
+        lambda args: _tool_build_protocol_tooling(settings, args),
+    )
+
+    # 5. Save enrichment protocol (with auto-verification)
     session.register_tool(
         ToolDefinition(
             name="save_enrichment_protocol",
             description=(
                 "Save a completed enrichment protocol. Call once the user has confirmed "
-                "the protocol definition."
+                "the protocol definition. Automatically runs a verification test on a "
+                "sample file and returns the result."
             ),
             input_schema={
                 "type": "object",
@@ -133,10 +186,10 @@ def _register_enrichment_tools(
                 "required": ["protocol_yaml"],
             },
         ),
-        lambda args: _tool_save_enrichment_protocol(settings, saved, session, args),
+        lambda args: _tool_save_enrichment_protocol(settings, imported_files, saved, args),
     )
 
-    # 5. Finish the enrichment setup session
+    # 6. Finish the enrichment setup session
     session.register_tool(
         ToolDefinition(
             name="finish_enrichment_setup",
@@ -197,10 +250,46 @@ def _tool_finish_enrichment(session: ChatSession, saved: list) -> str:
     return "Enrichment setup skipped."
 
 
+def _tool_build_protocol_tooling(settings: "Settings", args: dict) -> str:
+    """Invoke the Claude Code SDK builder agent to set up tooling."""
+    from .sdk_builder import run_sdk_builder
+
+    task = args.get("task", "")
+    media_context = args.get("media_context", "")
+    if not task:
+        return "Error: 'task' is required."
+
+    tools = load_tools(settings.tools_registry_path)
+    registry_summary = format_registry_for_prompt(tools)
+    project_dir = settings.tools_registry_path.parent.parent  # config/.. = project root
+
+    try:
+        result = run_sdk_builder(task, media_context, registry_summary, project_dir)
+    except Exception as e:
+        return f"SDK agent failed: {e}"
+
+    # Register new tools
+    new_tools = result.get("new_tools", [])
+    if new_tools:
+        # We don't have a protocol name yet, use a placeholder
+        add_tools(settings.tools_registry_path, new_tools, installed_by="(pending protocol)")
+
+    # Return the command_template and notes to the authoring session
+    lines = [f"command_template: {result['command_template']}"]
+    if result.get("verification_output"):
+        lines.append(f"\nVerification: {result['verification_output']}")
+    if result.get("notes"):
+        lines.append(f"\nNotes: {result['notes']}")
+    if new_tools:
+        lines.append(f"\nRegistered {len(new_tools)} new tool(s) in the tool registry.")
+
+    return "\n".join(lines)
+
+
 def _tool_save_enrichment_protocol(
     settings: "Settings",
+    imported_files: list[Path],
     saved: list,
-    session: ChatSession,
     args: dict,
 ) -> str:
     protocol_yaml = args.get("protocol_yaml", "")
@@ -218,133 +307,153 @@ def _tool_save_enrichment_protocol(
 
         path = save_protocol(protocol, settings.protocols_dir)
         saved.append(protocol)
-        # Don't set session.done — user might want to save more than one protocol
-        return f"Protocol '{protocol.name}' saved to {path}."
+
+        # Update tool registry: fix "pending protocol" entries to use real name
+        _update_pending_protocol_name(settings, protocol.name)
+
+        # Auto-verify: run enrichment on first available file
+        verification = _verify_enrichment_protocol(protocol, imported_files, settings)
+        result = f"Protocol '{protocol.name}' saved to {path}."
+        if verification:
+            result += f"\n\nVerification result (run on sample file):\n{verification}"
+        return result
 
     except Exception as e:
         return f"Error saving protocol: {e}"
 
 
-_ENRICHMENT_SYSTEM_PROMPT = """\
-You are the enrichment assistant for Sheaf, a personal media archive management system.
+def _update_pending_protocol_name(settings: "Settings", protocol_name: str) -> None:
+    """Replace '(pending protocol)' in tools.yaml with the actual protocol name."""
+    from .tools_registry import load_tools, save_tools
+    tools = load_tools(settings.tools_registry_path)
+    changed = False
+    for t in tools:
+        if t.get("installed_by") == "(pending protocol)":
+            t["installed_by"] = protocol_name
+            changed = True
+    if changed:
+        save_tools(settings.tools_registry_path, tools)
 
-Your job is to help the user define enrichment protocols — background processing steps
-that extract metadata, generate descriptions, create tags, run OCR, etc.
 
-## Execution methods (choose the right one)
+def _verify_enrichment_protocol(
+    protocol,
+    imported_files: list[Path],
+    settings: "Settings",
+) -> str:
+    """Run the protocol on the first available file and return the output as a string."""
+    # Find a candidate file
+    candidate = next((p for p in imported_files if p.exists()), None)
+    if candidate is None:
+        return "(no sample file available for verification)"
 
-Sheaf supports three execution methods. **Default to local methods** — they are free,
-private, and work offline. Only suggest `method: claude` when the user explicitly asks.
+    # Build a minimal sidecar read
+    from ..jobs.worker import _sidecar_path_for
+    rel = str(candidate.relative_to(settings.archive_root))
+    sidecar_path = _sidecar_path_for(settings.archive_root, rel)
 
-### method: command (preferred for scripts and CLI tools)
-Runs a shell command. The command must print JSON to stdout.
-Variables available in command_template: {file_path}, {archive_root}, {sidecar_path}
+    try:
+        from ..archive.sidecar import read_sidecar
+        sidecar_data = read_sidecar(sidecar_path) if sidecar_path.exists() else {}
+    except Exception:
+        sidecar_data = {}
 
-Example — using exiftool to extract GPS:
-```yaml
-method: command
-command_template: exiftool -json -GPS:all "{file_path}" | python3 -c "import sys,json; d=json.load(sys.stdin)[0]; print(json.dumps({'lat': d.get('GPSLatitude'), 'lon': d.get('GPSLongitude')}))"
-```
+    # Build enrichment context and run
+    import sqlite3
+    from .executor import EnrichmentContext, run_enrichment
 
-Example — calling a custom Python script:
-```yaml
-method: command
-command_template: python3 /path/to/describe.py "{file_path}"
-```
+    # We use an in-memory db just for the verification run (don't index)
+    conn = sqlite3.connect(":memory:")
+    try:
+        from ..db.schema import create_tables
+        create_tables(conn)
+    except Exception:
+        pass
 
-### method: ollama (preferred for vision/language tasks)
-Calls a locally running Ollama model. Ideal for image description, tagging, captioning.
-Requires Ollama to be running (`ollama serve`) with the chosen model pulled.
+    ctx = EnrichmentContext(
+        file_path=candidate,
+        sidecar_path=sidecar_path,
+        sidecar_data=sidecar_data,
+        protocol=protocol,
+        settings=settings,
+        conn=conn,
+    )
 
-```yaml
-method: ollama
-ollama_model: llava        # or llama3.2-vision, moondream, bakllava, etc.
-instructions: |
-  Describe what you see in this photo. Return JSON with:
-  description (one sentence), tags (list of strings), subject (landscape/portrait/etc.)
-```
+    try:
+        from .executor import _run_command_enrichment, _run_claude_enrichment
+        method = protocol.method or "command"
+        if method == "command":
+            result = _run_command_enrichment(ctx)
+        elif method == "claude":
+            # Don't run Claude enrichment in verification — too expensive
+            return "(claude enrichment: skipping auto-verification)"
+        else:
+            return f"(unknown method {method!r}: skipping auto-verification)"
 
-### method: claude (only when user requests it)
-Calls the Claude API. Costs money; requires ANTHROPIC_API_KEY; not private.
-Use only if the user explicitly wants Claude-based enrichment.
+        return json.dumps(result, indent=2, default=str)
+    except Exception as e:
+        return f"Verification failed: {e}"
+    finally:
+        conn.close()
 
-```yaml
-method: claude
-instructions: |
-  Analyze the file metadata and produce enrichment data.
-```
 
-## Full protocol format (YAML)
-
-```yaml
-name: <unique-identifier>
-type: enrichment
-version: "1"
-created: "YYYY-MM-DD"
-maturity: draft
-description: <one sentence>
-media_types: [photo]             # file_type categories this applies to
-output_fields:                   # JSON keys this protocol produces
-  - description
-  - tags
-method: command                  # or ollama, claude
-command_template: "..."          # if method=command
-ollama_model: "..."              # if method=ollama
-instructions: |                  # prompt for ollama or claude; notes for command
-  ...
-```
-
-## Your workflow
-
-1. Use list_sample_files and read_file_metadata to understand the media.
-2. Use list_existing_protocols to avoid duplicating existing enrichment.
-3. Suggest enrichment steps; ask the user what matters to them.
-4. Ask what local tools are available (exiftool, ollama, custom scripts).
-5. Draft a protocol using the appropriate method; confirm with the user.
-6. Call save_enrichment_protocol once confirmed.
-
-## Important
-
-- Always ask about local tooling before suggesting ollama or command methods.
-- output_fields should be concrete and useful for search (e.g. description, tags, gps_coords).
-- Protocol name: lowercase with hyphens (e.g. photo-description-ollama, photo-exif-gps).
-- Multiple enrichment protocols can run on the same file type.
-- The user can always skip enrichment setup now and add it later.
-- When the user is done (all protocols saved, or they decline enrichment), call
-  finish_enrichment_setup to end the session cleanly.
-"""
-
+# ---------------------------------------------------------------------------
+# Import protocol authoring
+# ---------------------------------------------------------------------------
 
 def draft_import_protocol(
     source_path: Path,
     adapter: BaseAdapter,
     settings: "Settings",
+    classification_ctx: dict | None = None,
 ) -> ImportProtocol | None:
     """Run the conversational import learning flow.
 
     Guides the user and the model through investigating the source,
-    drafting a protocol, previewing it, and saving it.
+    drafting a protocol (and optionally shape + identification protocol), and saving it.
+
+    classification_ctx: optional dict with keys 'classification', 'shape', 'id_confidence'
+    if the source has already been identified by the classifier pipeline.
 
     Returns the saved ImportProtocol, or None if the user aborted.
     """
     system_prompt = _load_system_prompt(settings)
     session = ChatSession(adapter, system=system_prompt, max_tokens=8096)
-    saved_protocol: list[ImportProtocol] = []  # mutable container
+    saved_protocol: list[ImportProtocol] = []
 
-    # Register tools
     _register_tools(session, source_path, settings, saved_protocol)
 
-    # Seed the conversation with context about what we're doing
-    opening = session.tool_loop(
-        f"I want to import media from: {source_path}\n\n"
-        "Please investigate the source and help me create an import protocol. "
-        "Start by examining the files and directory structure, then ask me any "
-        "questions you need to draft a protocol."
+    # Build opening context
+    context_lines = [f"I want to import media from: {source_path}"]
+
+    if classification_ctx:
+        cls = classification_ctx.get("classification")
+        shape = classification_ctx.get("shape")
+        conf = classification_ctx.get("id_confidence", 0.0)
+        if cls:
+            context_lines.append(f"\nThe source has been identified as: {cls!r} (confidence {conf:.0%})")
+        if shape:
+            context_lines.append(f"Matched structural shape: {shape.name} — {shape.description}")
+        context_lines.append(
+            "\nSince identification already ran, you may skip to drafting the import protocol "
+            "using `accepts_classification` (new-style) rather than `triggers`."
+        )
+    else:
+        # Check if any shapes/identification protocols exist at all
+        existing_shapes = load_shapes(settings.shapes_dir)
+        if not existing_shapes:
+            context_lines.append(
+                "\nNo structural shapes have been defined yet. You may need to define a shape "
+                "and identification protocol before (or alongside) the import protocol. "
+                "Use save_shape and save_identification_protocol tools for this."
+            )
+
+    context_lines.append(
+        "\n\nPlease investigate the source and help me create an import protocol. "
+        "Start by examining the files and directory structure."
     )
 
+    opening = session.tool_loop("\n".join(context_lines))
     print(f"\nSheaf: {opening}\n")
-
-    # Hand off to the readline loop
     readline_chat(session)
 
     if saved_protocol:
@@ -353,7 +462,285 @@ def draft_import_protocol(
 
 
 # ---------------------------------------------------------------------------
-# Tool registrations
+# Identification protocol authoring (standalone)
+# ---------------------------------------------------------------------------
+
+def draft_identification_protocol(
+    adapter: BaseAdapter,
+    settings: "Settings",
+) -> None:
+    """Standalone conversational session to create an identification protocol."""
+    shapes = load_shapes(settings.shapes_dir)
+    shapes_summary = _format_shapes_summary(shapes)
+
+    system_prompt = _load_prompt("identification", shapes_summary=shapes_summary)
+    session = ChatSession(adapter, system=system_prompt, max_tokens=8096)
+    saved: list = []
+
+    _register_identification_tools(session, settings, saved)
+
+    opening = session.tool_loop(
+        "I want to create a new identification protocol. "
+        "Please walk me through defining what semantic classification it produces "
+        "and which structural shapes trigger it."
+    )
+    print(f"\nSheaf: {opening}\n")
+    readline_chat(session)
+
+    if saved:
+        print(f"\nSaved {len(saved)} identification protocol(s).")
+
+
+def _register_identification_tools(
+    session: ChatSession,
+    settings: "Settings",
+    saved: list,
+) -> None:
+    session.register_tool(
+        ToolDefinition(
+            name="list_existing_shapes",
+            description="List all known structural shapes.",
+            input_schema={"type": "object", "properties": {}},
+        ),
+        lambda _: _tool_list_shapes(settings),
+    )
+    session.register_tool(
+        ToolDefinition(
+            name="save_shape",
+            description="Save a new structural shape definition.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "shape_yaml": {
+                        "type": "string",
+                        "description": "Shape definition in YAML format.",
+                    },
+                },
+                "required": ["shape_yaml"],
+            },
+        ),
+        lambda args: _tool_save_shape(settings, args),
+    )
+    session.register_tool(
+        ToolDefinition(
+            name="save_identification_protocol",
+            description="Save a completed identification protocol.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "protocol_yaml": {
+                        "type": "string",
+                        "description": "Identification protocol in YAML format.",
+                    },
+                },
+                "required": ["protocol_yaml"],
+            },
+        ),
+        lambda args: _tool_save_identification_protocol(settings, saved, session, args),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Protocol editing
+# ---------------------------------------------------------------------------
+
+def edit_protocol(
+    protocol_name: str,
+    adapter: BaseAdapter,
+    settings: "Settings",
+) -> None:
+    """Re-enter a conversational session to revise an existing protocol.
+
+    The model is seeded with the current YAML and asks the user what they
+    want changed. Saves the updated protocol once the user confirms.
+    """
+    from .loader import get_protocol
+    from .model import EnrichmentProtocol
+
+    try:
+        protocol = get_protocol(protocol_name, settings.protocols_dir)
+    except Exception as e:
+        print(f"Error loading protocol: {e}")
+        return
+
+    # Serialize to YAML so the model can see it
+    from .model import protocol_to_dict
+    current_yaml = yaml.dump(protocol_to_dict(protocol), default_flow_style=False,
+                             sort_keys=False, allow_unicode=True)
+
+    tools = load_tools(settings.tools_registry_path)
+    registry_summary = format_registry_for_prompt(tools)
+
+    system_prompt = _load_prompt("edit", registry_summary=registry_summary)
+    session = ChatSession(adapter, system=system_prompt, max_tokens=8096)
+
+    # Register tools appropriate to the protocol type
+    if isinstance(protocol, ImportProtocol):
+        saved: list = []
+        # For import editing, we need a source_path — use a dummy that clearly has none
+        # The edit tools don't need to inspect source files, just validate/save
+        _register_edit_import_tools(session, settings, saved)
+        opening = session.tool_loop(
+            f"I want to edit this import protocol:\n\n```yaml\n{current_yaml}```\n\n"
+            "What would you like to change?"
+        )
+    else:
+        saved = []
+        imported_files: list[Path] = []  # no files context during standalone edit
+        _register_edit_enrichment_tools(session, settings, saved)
+        opening = session.tool_loop(
+            f"I want to edit this enrichment protocol:\n\n```yaml\n{current_yaml}```\n\n"
+            "What would you like to change?"
+        )
+
+    print(f"\nSheaf: {opening}\n")
+    readline_chat(session)
+
+
+def _register_edit_import_tools(
+    session: ChatSession,
+    settings: "Settings",
+    saved: list,
+) -> None:
+    """Tools for editing an existing import protocol (no source to inspect)."""
+    session.register_tool(
+        ToolDefinition(
+            name="list_existing_protocols",
+            description="List all existing protocols for reference.",
+            input_schema={"type": "object", "properties": {}},
+        ),
+        lambda _: _tool_list_protocols(settings),
+    )
+    session.register_tool(
+        ToolDefinition(
+            name="save_protocol",
+            description=(
+                "Save the revised import protocol, overwriting the previous version. "
+                "Call once the user has confirmed the changes are correct."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "protocol_yaml": {"type": "string"},
+                },
+                "required": ["protocol_yaml"],
+            },
+        ),
+        lambda args: _tool_save_protocol(settings, saved, session, args),
+    )
+
+
+def _register_edit_enrichment_tools(
+    session: ChatSession,
+    settings: "Settings",
+    saved: list,
+) -> None:
+    """Tools for editing an existing enrichment protocol."""
+    session.register_tool(
+        ToolDefinition(
+            name="list_existing_protocols",
+            description="List all existing protocols for reference.",
+            input_schema={"type": "object", "properties": {}},
+        ),
+        lambda _: _tool_list_protocols(settings),
+    )
+    session.register_tool(
+        ToolDefinition(
+            name="build_protocol_tooling",
+            description=(
+                "Spawn a Claude Code agent to install or update tooling this protocol needs. "
+                "Ask the user before calling this."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string"},
+                    "media_context": {"type": "string"},
+                },
+                "required": ["task", "media_context"],
+            },
+        ),
+        lambda args: _tool_build_protocol_tooling(settings, args),
+    )
+    session.register_tool(
+        ToolDefinition(
+            name="save_enrichment_protocol",
+            description=(
+                "Save the revised enrichment protocol, overwriting the previous version. "
+                "Call once the user has confirmed the changes are correct."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "protocol_yaml": {"type": "string"},
+                },
+                "required": ["protocol_yaml"],
+            },
+        ),
+        # No files to verify against during standalone edit — skip verification
+        lambda args: _tool_save_enrichment_protocol(settings, [], saved, args),
+    )
+    session.register_tool(
+        ToolDefinition(
+            name="finish_enrichment_setup",
+            description="Call when editing is complete.",
+            input_schema={"type": "object", "properties": {}},
+        ),
+        lambda _: _tool_finish_enrichment(session, saved),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Protocol explanation
+# ---------------------------------------------------------------------------
+
+def explain_protocol(
+    protocol_name: str,
+    adapter: BaseAdapter,
+    settings: "Settings",
+) -> None:
+    """Conversational explanation of what a protocol does and why.
+
+    More natural-language than `sheaf protocols show`.
+    """
+    from .loader import get_protocol
+    from .model import protocol_to_dict
+
+    try:
+        protocol = get_protocol(protocol_name, settings.protocols_dir)
+    except Exception as e:
+        print(f"Error: {e}")
+        return
+
+    current_yaml = yaml.dump(protocol_to_dict(protocol), default_flow_style=False,
+                             sort_keys=False, allow_unicode=True)
+
+    system_prompt = (
+        "You are a helpful assistant explaining how a Sheaf media archive protocol works. "
+        "Given a protocol definition, explain in plain language: what files it handles, "
+        "what it does with them, where they end up, and what enrichment runs. "
+        "Be concise but complete. After your explanation, invite the user to ask questions."
+    )
+    session = ChatSession(adapter, system=system_prompt, max_tokens=4096)
+    # Read-only: register list_existing_protocols only
+    session.register_tool(
+        ToolDefinition(
+            name="list_existing_protocols",
+            description="List all protocols for context.",
+            input_schema={"type": "object", "properties": {}},
+        ),
+        lambda _: _tool_list_protocols(settings),
+    )
+
+    opening = session.tool_loop(
+        f"Please explain this protocol:\n\n```yaml\n{current_yaml}```"
+    )
+    print(f"\nSheaf: {opening}\n")
+    readline_chat(session)
+
+
+# ---------------------------------------------------------------------------
+# Tool registrations (import authoring)
 # ---------------------------------------------------------------------------
 
 def _register_tools(
@@ -362,8 +749,56 @@ def _register_tools(
     settings: "Settings",
     saved_protocol: list,
 ) -> None:
+    # Shape and identification tools (for new sources that need new layers)
+    session.register_tool(
+        ToolDefinition(
+            name="list_existing_shapes",
+            description="List all known structural shapes.",
+            input_schema={"type": "object", "properties": {}},
+        ),
+        lambda _: _tool_list_shapes(settings),
+    )
+    session.register_tool(
+        ToolDefinition(
+            name="save_shape",
+            description=(
+                "Save a structural shape definition. Use when this source type is "
+                "new and no existing shape describes its structure."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "shape_yaml": {
+                        "type": "string",
+                        "description": "Shape definition in YAML format.",
+                    },
+                },
+                "required": ["shape_yaml"],
+            },
+        ),
+        lambda args: _tool_save_shape(settings, args),
+    )
+    session.register_tool(
+        ToolDefinition(
+            name="save_identification_protocol",
+            description=(
+                "Save an identification protocol that classifies this source type. "
+                "Use when there is no existing identification protocol for the shape."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "protocol_yaml": {
+                        "type": "string",
+                        "description": "Identification protocol in YAML format.",
+                    },
+                },
+                "required": ["protocol_yaml"],
+            },
+        ),
+        lambda args: _tool_save_identification_protocol(settings, [], None, args),
+    )
 
-    # 1. List source files
     session.register_tool(
         ToolDefinition(
             name="list_source_files",
@@ -388,7 +823,6 @@ def _register_tools(
         lambda args: _tool_list_source_files(source_path, args),
     )
 
-    # 2. Read EXIF data
     session.register_tool(
         ToolDefinition(
             name="read_exif",
@@ -410,7 +844,6 @@ def _register_tools(
         lambda args: _tool_read_exif(source_path, args),
     )
 
-    # 3. List existing protocols
     session.register_tool(
         ToolDefinition(
             name="list_existing_protocols",
@@ -423,7 +856,6 @@ def _register_tools(
         lambda _args: _tool_list_protocols(settings),
     )
 
-    # 4. Preview protocol
     session.register_tool(
         ToolDefinition(
             name="preview_protocol",
@@ -446,7 +878,6 @@ def _register_tools(
         lambda args: _tool_preview_protocol(source_path, settings, args),
     )
 
-    # 5. Save (finish) protocol
     session.register_tool(
         ToolDefinition(
             name="save_protocol",
@@ -473,6 +904,71 @@ def _register_tools(
 # ---------------------------------------------------------------------------
 # Tool implementations
 # ---------------------------------------------------------------------------
+
+def _tool_list_shapes(settings: "Settings") -> str:
+    shapes = load_shapes(settings.shapes_dir)
+    if not shapes:
+        return "No shapes defined yet."
+    lines = ["Known shapes:"]
+    for name, s in sorted(shapes.items()):
+        lines.append(f"\n[shape] {name}")
+        lines.append(f"  Description: {s.description}")
+        lines.append(f"  Container: {s.is_container}")
+        for ind in s.indicators:
+            for k, v in ind.items():
+                lines.append(f"  indicator: {k}: {v}")
+    return "\n".join(lines)
+
+
+def _tool_save_shape(settings: "Settings", args: dict) -> str:
+    import yaml as _yaml
+    shape_yaml = args.get("shape_yaml", "")
+    try:
+        data = _yaml.safe_load(shape_yaml)
+        errors = validate_shape_yaml(data)
+        if errors:
+            return "Cannot save — validation errors:\n" + "\n".join(f"  - {e}" for e in errors)
+        shape = shape_from_dict(data)
+        path = save_shape(shape, settings.shapes_dir)
+        return f"Shape '{shape.name}' saved to {path}."
+    except Exception as e:
+        return f"Error saving shape: {e}"
+
+
+def _tool_save_identification_protocol(
+    settings: "Settings",
+    saved: list,
+    session: "ChatSession | None",
+    args: dict,
+) -> str:
+    import yaml as _yaml
+    protocol_yaml = args.get("protocol_yaml", "")
+    try:
+        data = _yaml.safe_load(protocol_yaml)
+        data["maturity"] = "draft"
+        errors = validate_protocol_yaml(data)
+        if errors:
+            return "Cannot save — validation errors:\n" + "\n".join(f"  - {e}" for e in errors)
+        protocol = protocol_from_dict(data)
+        if not isinstance(protocol, IdentificationProtocol):
+            return "Error: this is not an identification protocol (type must be 'identification')."
+        path = save_protocol(protocol, settings.protocols_dir)
+        saved.append(protocol)
+        if session is not None:
+            session.done = True
+        return f"Identification protocol '{protocol.name}' saved to {path}."
+    except Exception as e:
+        return f"Error saving protocol: {e}"
+
+
+def _format_shapes_summary(shapes: dict) -> str:
+    if not shapes:
+        return "No shapes defined yet."
+    lines = []
+    for name, s in sorted(shapes.items()):
+        lines.append(f"  {name}: {s.description}")
+    return "\n".join(lines)
+
 
 def _tool_list_source_files(source_path: Path, args: dict) -> str:
     subdir = args.get("subdirectory", "")
@@ -522,7 +1018,6 @@ def _tool_read_exif(source_path: Path, args: dict) -> str:
         if result.returncode == 0:
             data = json.loads(result.stdout)
             if data:
-                # Return a readable subset of the most useful tags
                 tags = data[0]
                 useful = {k: v for k, v in tags.items()
                           if any(kw in k for kw in
@@ -538,20 +1033,39 @@ def _tool_read_exif(source_path: Path, args: dict) -> str:
 
 def _tool_list_protocols(settings: "Settings") -> str:
     imports, enrichments = load_all_protocols(settings.protocols_dir)
-    if not imports and not enrichments:
+    id_protocols = load_identification_protocols(settings.protocols_dir)
+
+    if not imports and not enrichments and not id_protocols:
         return "No protocols exist yet."
 
     lines = ["Existing protocols:"]
-    for name, p in imports.items():
+
+    for name, p in sorted(id_protocols.items()):
+        lines.append(f"\n[identification] {name} ({p.maturity.value})")
+        lines.append(f"  Description: {p.description}")
+        lines.append(f"  Classification: {p.classification}")
+        lines.append(f"  Method: {p.method}")
+        shapes_triggered = [t.get("shape", "") for t in p.triggers]
+        if shapes_triggered:
+            lines.append(f"  Triggered by shapes: {', '.join(shapes_triggered)}")
+
+    for name, p in sorted(imports.items()):
         lines.append(f"\n[import] {name} ({p.maturity.value})")
         lines.append(f"  Description: {p.description}")
-        lines.append(f"  Triggers: {p.triggers}")
+        if p.accepts_classification:
+            lines.append(f"  Accepts classification: {p.accepts_classification}")
+        elif p.triggers:
+            lines.append(f"  Triggers (legacy): {p.triggers}")
         lines.append(f"  Category: {p.category_template}" +
                      (f" / {p.subcategory_template}" if p.subcategory_template else ""))
         lines.append(f"  Filename: {p.filename_template}")
-    for name, p in enrichments.items():
+
+    for name, p in sorted(enrichments.items()):
         lines.append(f"\n[enrichment] {name} ({p.maturity.value})")
         lines.append(f"  Description: {p.description}")
+        if p.command_template:
+            lines.append(f"  Command: {p.command_template[:80]}")
+
     return "\n".join(lines)
 
 
@@ -569,8 +1083,8 @@ def _tool_preview_protocol(source_path: Path, settings: "Settings", args: dict) 
 
         from .executor import ProtocolExecutor
         executor = ProtocolExecutor()
-        actions = executor.plan(source_path, protocol, settings)
-        return executor.preview(actions, settings.archive_root)
+        result = executor.plan(source_path, protocol, settings)
+        return executor.preview(result, settings.archive_root)
 
     except Exception as e:
         return f"Error previewing protocol: {e}"
@@ -585,7 +1099,6 @@ def _tool_save_protocol(
     protocol_yaml = args.get("protocol_yaml", "")
     try:
         data = yaml.safe_load(protocol_yaml)
-        # Force maturity to draft
         data["maturity"] = "draft"
         errors = validate_protocol_yaml(data)
         if errors:
@@ -605,68 +1118,24 @@ def _tool_save_protocol(
 
 
 # ---------------------------------------------------------------------------
-# System prompt
+# System prompts
 # ---------------------------------------------------------------------------
 
+_PROMPTS_DIR = Path(__file__).parent.parent.parent / "config" / "prompts"
+
+
+def _load_prompt(name: str, **kwargs) -> str:
+    """Load a prompt from config/prompts/<name>.txt, applying any format kwargs."""
+    path = _PROMPTS_DIR / f"{name}.txt"
+    if not path.exists():
+        raise FileNotFoundError(f"Prompt file not found: {path}")
+    text = path.read_text()
+    return text.format(**kwargs) if kwargs else text
+
+
+def _build_enrichment_system_prompt(registry_summary: str) -> str:
+    return _load_prompt("enrichment", registry_summary=registry_summary)
+
+
 def _load_system_prompt(settings: "Settings") -> str:
-    prompt_path = Path(__file__).parent.parent.parent / "config" / "system_prompt.txt"
-    if prompt_path.exists():
-        return prompt_path.read_text()
-    return _DEFAULT_SYSTEM_PROMPT
-
-
-_DEFAULT_SYSTEM_PROMPT = """You are the import assistant for Sheaf, a personal media archive management system.
-
-Your job is to help the user create import protocols that define how to bring media from a specific source into the archive.
-
-## Archive structure
-
-The archive is organised as:
-  <archive_root>/YYYY/YYYYMMDD/<category>/[<subcategory>/]/YYYYMMDD_<suffix>.<ext>
-
-All metadata lives in a parallel .meta/ tree:
-  <archive_root>/YYYY/YYYYMMDD/.meta/<category>/[<subcategory>/]/YYYYMMDD_<suffix>.<ext>.json
-
-The framework enforces the YYYY/YYYYMMDD/ hierarchy and the YYYYMMDD_ filename prefix.
-Everything below that — category directories, subcategories, filename suffixes — is defined by the import protocol.
-
-## Protocol format (YAML)
-
-```yaml
-name: <unique-identifier>        # e.g. panasonic-dmc-ts3
-type: import
-version: "1"
-created: "YYYY-MM-DD"
-maturity: draft
-description: <one sentence>
-triggers:
-  - extensions: [.jpg, .jpeg]    # file extensions this protocol handles
-  # other trigger conditions as needed
-category_template: "<category>"          # e.g. "photo", or a fixed string
-subcategory_template: "<subcategory>"    # optional; omit or set to null if not needed
-filename_template: "{date}_{time}_{original_name}"   # without extension
-enrichment_chain: []             # list of enrichment protocol names to run after import
-instructions: ""                 # optional notes for future reference
-```
-
-Template variables available: {date} (YYYYMMDD), {time} (HHMM), {original_name} (filename stem),
-{original_filename} (full filename), {extension} (without dot), {index}, {index2}, {index4}.
-
-## Your workflow
-
-1. Use list_source_files to understand the source structure and file types.
-2. Use read_exif on 1-2 representative files to see what metadata is available.
-3. Use list_existing_protocols to see what conventions are already in use.
-4. Ask the user any questions needed to determine: category, subcategory, filename format, which files to import.
-5. Draft a protocol and use preview_protocol to verify it produces correct filenames and paths.
-6. Show the preview to the user and ask for confirmation.
-7. Once confirmed, call save_protocol with the final YAML.
-
-## Important
-
-- Be precise about filenames. Show concrete examples from the preview.
-- Ask about files the user might want to skip (e.g. sidecar files, video alongside photos).
-- If the source has multiple file types (photo + video), ask whether they should use one protocol or separate ones.
-- Keep it simple — the user can always refine the protocol later.
-- The protocol name should be descriptive and use lowercase with hyphens (e.g. panasonic-dmc-ts3).
-"""
+    return _load_prompt("import")

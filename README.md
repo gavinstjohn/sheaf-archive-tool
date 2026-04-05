@@ -36,8 +36,15 @@ This creates `db/archive.db`, `logs/`, and default config files in `config/`.
 | `sheaf history rollback <tx-id>` | done | Reverse a transaction (dry-run by default; add `--confirm`) |
 | `sheaf reindex` | done | Rebuild database from `.meta/` sidecars |
 | `sheaf verify` | done | Check archive integrity |
-| `sheaf protocols list` | done | List all learned protocols |
+| `sheaf shapes list` | done | List all known structural shapes |
+| `sheaf shapes show <name>` | done | Inspect a shape definition |
+| `sheaf protocols list` | done | List all learned protocols (identification, import, enrichment) |
 | `sheaf protocols show <name>` | done | Inspect a protocol |
+| `sheaf protocols new [--type TYPE] [--source PATH]` | done | Start a conversational session to create a new protocol (supports identification type) |
+| `sheaf protocols edit <name>` | done | Revise an existing protocol conversationally |
+| `sheaf protocols explain <name>` | done | Get a plain-language explanation of a protocol |
+| `sheaf protocols test <name> <source>` | done | Dry-run a protocol against a source or file |
+| `sheaf protocols delete <name>` | done | Remove a protocol (with confirmation) |
 | `sheaf import <path>` | done | Import media from a source path |
 | `sheaf jobs` | done | View the enrichment job queue |
 | `sheaf jobs --worker` | done | Run the enrichment worker (processes queue continuously) |
@@ -105,6 +112,34 @@ Async enrichment queue. `sheaf jobs --worker` processes the queue.
 - `sheaf jobs --worker` — run worker loop
 - `sheaf jobs review <job-id>` — interactive review of needs-review jobs; accepts, rejects, or enters chat to refine
 - Note: enrichment protocols are draft by default → jobs go to `needs-review`; promote to `trusted` via `sheaf protocols show` then edit the YAML
+
+### Phase 9 — Four-Layer Protocol Architecture ✓
+Shape → Identification → Import → Enrichment pipeline. Structural analysis and classification before import.
+
+- `src/protocols/model.py` — added `Shape` dataclass (`name`, `description`, `indicators`, `is_container`); added `IdentificationProtocol` type; added `accepts_classification` field to `ImportProtocol`; `shape_from_dict` / `shape_to_dict`
+- `src/protocols/loader.py` — `load_shapes()`, `load_identification_protocols()`, `save_shape()`, `get_shape()`; updated `get_protocol()` to search `identification/` subdir; validation supports `identification` type
+- `src/protocols/classifier.py` — **New**: `analyze_structure()` (extension distribution, DCIM detection, filename pattern detection); `match_shapes()` (evaluates indicator conditions); `run_identification()` (heuristic and claude methods); `classify_source()` entrypoint; `find_logical_groups()` for container decomposition
+- `src/protocols/matcher.py` — added `match_by_classification()` for new-style protocols; legacy `match_protocols()` now only applies to old-style `triggers` protocols
+- `src/protocols/author.py` — `draft_import_protocol()` now accepts `classification_ctx` (pre-identified); added `draft_identification_protocol()`; added `save_shape` and `save_identification_protocol` tools to learning flow; updated system prompt to explain all four layers; `_tool_list_protocols()` includes identification protocols
+- `src/config.py` — `shapes_dir` field added to `Settings`
+- `src/cli.py` — `_resolve_protocol()` uses classifier pipeline before falling back to legacy matching; `cmd_shapes()` added; `cmd_protocols()` handles `IdentificationProtocol` in list/show; shapes subcommand added to argparse
+- `shapes/` — new directory for structural shape YAML definitions (auto-populated by learning flow)
+- `protocols/identification/` — new directory for identification protocol YAMLs
+- `sheaf shapes list / show <name>` — inspect structural shapes
+
+### Phase 8 — Protocol Building Pipeline ✓
+First-class CLI commands for protocol lifecycle. Tool-agnostic tooling via Claude Code SDK.
+
+- `src/protocols/tools_registry.py` — `load_tools`, `save_tools`, `add_tools`, `format_registry_for_prompt`; tracks installed models, scripts, and binaries across all protocols
+- `src/protocols/sdk_builder.py` — `run_sdk_builder()`: spawns a Claude Code SDK agent to install/verify tooling, streams output inline to terminal, returns `command_template` + registry entries
+- `src/protocols/author.py` — added `edit_protocol()`, `explain_protocol()`; enrichment authoring now: loads tool registry (shown in system prompt), offers `build_protocol_tooling` tool (SDK agent), auto-verifies saved protocol on a sample file; system prompt updated to be tool-agnostic (`method: command` is universal)
+- `src/protocols/executor.py` — `method: ollama` now logs a deprecation warning; new protocols use `method: command`
+- `config/tools.yaml` — new tool registry file (auto-managed)
+- `sheaf protocols new [--type TYPE] [--source PATH]` — standalone protocol creation
+- `sheaf protocols edit <name>` — conversational revision of existing protocols
+- `sheaf protocols explain <name>` — plain-language explanation of what a protocol does
+- `sheaf protocols test <name> <source>` — dry-run against a source path or file
+- `sheaf protocols delete <name>` — remove with confirmation
 
 ### Phase 7 — Search, GUI, and Full `status` ✓
 Full-text search, thumbnail grid GUI, and complete dashboard.
